@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules using exact constructor signatures
+        // Initialize helper modules with correct constructor arguments
         ethernetBinder = EthernetNetworkBinder(this)
         livoxController = LivoxController()
         
