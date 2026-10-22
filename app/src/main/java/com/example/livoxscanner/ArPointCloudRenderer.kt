@@ -6,6 +6,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.view.Surface
 import com.google.ar.core.Coordinates2d
+import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -40,16 +41,21 @@ class ArPointCloudRenderer(
     @Volatile var pointCount = 0
         private set
 
+    // Latest ARCore camera pose so incoming LiDAR points can be anchored in 3D World Space
+    @Volatile var latestCameraPose: Pose? = null
+        private set
+
     val recordedColoredPoints = CopyOnWriteArrayList<ColoredPoint3D>()
 
     private val viewMatrix = FloatArray(16)
     private val projectionMatrix = FloatArray(16)
     private val vPMatrix = FloatArray(16)
 
-    var followArCamera = true
-    var orbitAngleX = 20f
-    var orbitAngleY = 0f
-    var orbitZoom = -6f
+    @Volatile var followArCamera = true
+    @Volatile var orbitAngleX = 20f
+    @Volatile var orbitAngleY = 0f
+    @Volatile var orbitZoom = -6f
+    @Volatile var pointSize = 8.0f
 
     private var pointProgram = 0
     private var bgProgram = 0
@@ -106,12 +112,13 @@ class ArPointCloudRenderer(
 
     private val vertexShaderCode = """
         uniform mat4 uMVPMatrix;
+        uniform float uPointSize;
         attribute vec3 aPosition;
         attribute vec3 aColor;
         varying vec3 vColor;
         void main() {
             gl_Position = uMVPMatrix * vec4(aPosition, 1.0);
-            gl_PointSize = 3.5;
+            gl_PointSize = uPointSize;
             vColor = aColor;
         }
     """.trimIndent()
@@ -123,6 +130,19 @@ class ArPointCloudRenderer(
             gl_FragColor = vec4(vColor, 1.0);
         }
     """.trimIndent()
+
+    /**
+     * Transforms a point from local ARCore Camera Space (-Z forward, +X right, +Y up)
+     * into ARCore World Space if tracking is active, or returns it directly if not tracking.
+     */
+    fun transformCameraToWorld(camX: Float, camY: Float, camZ: Float): FloatArray {
+        val pose = latestCameraPose
+        return if (followArCamera && fusionEngine.isTracking && pose != null) {
+            pose.transformPoint(floatArrayOf(camX, camY, camZ))
+        } else {
+            floatArrayOf(camX, camY, camZ)
+        }
+    }
 
     @Synchronized
     fun addColoredWorldPoints(points: List<ColoredPoint3D>) {
@@ -136,7 +156,6 @@ class ArPointCloudRenderer(
                 pointBuffer.put(base + 4, p.g / 255f)
                 pointBuffer.put(base + 5, p.b / 255f)
                 pointCount++
-                recordedColoredPoints.add(p)
             }
         }
     }
@@ -186,88 +205,101 @@ class ArPointCloudRenderer(
         viewportWidth = width
         viewportHeight = height
         val ratio = width.toFloat() / height.toFloat()
-        Matrix.frustumM(projectionMatrix, 0, -ratio * 0.1f, ratio * 0.1f, -0.1f, 0.1f, 0.1f, 100f)
+        Matrix.frustumM(projectionMatrix, 0, -ratio * 0.1f, ratio * 0.1f, -0.1f, 0.1f, 0.1f, 200f)
     }
 
     @Synchronized
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-        val session = arSession ?: return
-        if (cameraTextureId != -1) session.setCameraTextureName(cameraTextureId)
 
-        // Ensure ARCore always has the exact display dimensions and rotation
-        if (viewportWidth > 0 && viewportHeight > 0) {
-            if (displayRotation != lastAppliedRotation ||
-                viewportWidth != lastAppliedWidth ||
-                viewportHeight != lastAppliedHeight
-            ) {
-                session.setDisplayGeometry(displayRotation, viewportWidth, viewportHeight)
-                lastAppliedRotation = displayRotation
-                lastAppliedWidth = viewportWidth
-                lastAppliedHeight = viewportHeight
-            }
-        }
+        if (followArCamera) {
+            val session = arSession
+            if (session != null) {
+                if (cameraTextureId != -1) session.setCameraTextureName(cameraTextureId)
 
-        try {
-            val frame = session.update()
-            val camera = frame.camera
+                if (viewportWidth > 0 && viewportHeight > 0) {
+                    if (displayRotation != lastAppliedRotation ||
+                        viewportWidth != lastAppliedWidth ||
+                        viewportHeight != lastAppliedHeight
+                    ) {
+                        session.setDisplayGeometry(displayRotation, viewportWidth, viewportHeight)
+                        lastAppliedRotation = displayRotation
+                        lastAppliedWidth = viewportWidth
+                        lastAppliedHeight = viewportHeight
+                    }
+                }
 
-            // Ask ARCore to recalculate camera texture UVs when display geometry changes
-            if (frame.hasDisplayGeometryChanged()) {
-                quadCoords.position(0)
-                transformedTexCoords.position(0)
-                frame.transformCoordinates2d(
-                    Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-                    quadCoords,
-                    Coordinates2d.TEXTURE_NORMALIZED,
-                    transformedTexCoords
-                )
-            }
+                try {
+                    val frame = session.update()
+                    val camera = frame.camera
 
-            // 1. Draw Upright, Aspect-Corrected Camera Background Feed
-            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
-            GLES20.glUseProgram(bgProgram)
-            val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPosition")
-            val bgTexLoc = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
-            
-            quadCoords.position(0)
-            GLES20.glEnableVertexAttribArray(bgPosLoc)
-            GLES20.glVertexAttribPointer(bgPosLoc, 2, GLES20.GL_FLOAT, false, 0, quadCoords)
-            
-            transformedTexCoords.position(0)
-            GLES20.glEnableVertexAttribArray(bgTexLoc)
-            GLES20.glVertexAttribPointer(bgTexLoc, 2, GLES20.GL_FLOAT, false, 0, transformedTexCoords)
-            
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
-            GLES20.glUniform1i(GLES20.glGetUniformLocation(bgProgram, "sTexture"), 0)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            GLES20.glDisableVertexAttribArray(bgPosLoc)
-            GLES20.glDisableVertexAttribArray(bgTexLoc)
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+                    if (frame.hasDisplayGeometryChanged()) {
+                        quadCoords.position(0)
+                        transformedTexCoords.position(0)
+                        frame.transformCoordinates2d(
+                            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
+                            quadCoords,
+                            Coordinates2d.TEXTURE_NORMALIZED,
+                            transformedTexCoords
+                        )
+                    }
 
-            if (camera.trackingState == TrackingState.TRACKING) {
-                fusionEngine.isTracking = true
-                fusionEngine.recordPose(System.nanoTime(), camera.pose)
-                if (frameCounter++ % 2 == 0) {
-                    try {
-                        frame.acquireCameraImage().use { image ->
-                            colorizer.updateFromArFrame(image, camera.imageIntrinsics)
+                    // 1. Draw Upright Camera Feed
+                    GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+                    GLES20.glUseProgram(bgProgram)
+                    val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPosition")
+                    val bgTexLoc = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
+
+                    quadCoords.position(0)
+                    GLES20.glEnableVertexAttribArray(bgPosLoc)
+                    GLES20.glVertexAttribPointer(bgPosLoc, 2, GLES20.GL_FLOAT, false, 0, quadCoords)
+
+                    transformedTexCoords.position(0)
+                    GLES20.glEnableVertexAttribArray(bgTexLoc)
+                    GLES20.glVertexAttribPointer(bgTexLoc, 2, GLES20.GL_FLOAT, false, 0, transformedTexCoords)
+
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+                    GLES20.glUniform1i(GLES20.glGetUniformLocation(bgProgram, "sTexture"), 0)
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                    GLES20.glDisableVertexAttribArray(bgPosLoc)
+                    GLES20.glDisableVertexAttribArray(bgTexLoc)
+                    GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+
+                    if (camera.trackingState == TrackingState.TRACKING) {
+                        fusionEngine.isTracking = true
+                        latestCameraPose = camera.pose
+                        fusionEngine.recordPose(System.nanoTime(), camera.pose)
+                        if (frameCounter++ % 2 == 0) {
+                            try {
+                                frame.acquireCameraImage().use { image ->
+                                    colorizer.updateFromArFrame(image, camera.imageIntrinsics)
+                                }
+                            } catch (_: Exception) {}
                         }
-                    } catch (_: Exception) {}
+                        camera.getViewMatrix(viewMatrix, 0)
+                        camera.getProjectionMatrix(projectionMatrix, 0, 0.05f, 150.0f)
+                    } else {
+                        fusionEngine.isTracking = false
+                        // Fallback camera view matrix when ARCore is still in WAIT state
+                        // so you can STILL see live LiDAR points in front of you immediately!
+                        Matrix.setIdentityM(viewMatrix, 0)
+                        if (viewportWidth > 0 && viewportHeight > 0) {
+                            val ratio = viewportWidth.toFloat() / viewportHeight.toFloat()
+                            Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 150f)
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Ignore transient session pause exceptions
                 }
-                if (followArCamera) {
-                    camera.getViewMatrix(viewMatrix, 0)
-                    camera.getProjectionMatrix(projectionMatrix, 0, 0.1f, 100.0f)
-                }
-            } else {
-                fusionEngine.isTracking = false
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        if (!followArCamera) {
+        } else {
+            // 3D Orbit Mode (Camera feed is off, pure 3D inspection)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            if (viewportWidth > 0 && viewportHeight > 0) {
+                val ratio = viewportWidth.toFloat() / viewportHeight.toFloat()
+                Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 250f)
+            }
             Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, orbitZoom, 0f, 0f, 0f, 0f, 1f, 0f)
             val rot = FloatArray(16)
             Matrix.setIdentityM(rot, 0)
@@ -279,26 +311,32 @@ class ArPointCloudRenderer(
         }
 
         Matrix.multiplyMM(vPMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
-        
+
         // 2. Draw Point Cloud Overlay
-        GLES20.glUseProgram(pointProgram)
-        val strideBytes = 6 * 4
-        val posHandle = GLES20.glGetAttribLocation(pointProgram, "aPosition")
-        GLES20.glEnableVertexAttribArray(posHandle)
-        pointBuffer.position(0)
-        GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
+        if (pointCount > 0) {
+            GLES20.glUseProgram(pointProgram)
+            val strideBytes = 6 * 4
 
-        val colorHandle = GLES20.glGetAttribLocation(pointProgram, "aColor")
-        GLES20.glEnableVertexAttribArray(colorHandle)
-        pointBuffer.position(3)
-        GLES20.glVertexAttribPointer(colorHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
+            val posHandle = GLES20.glGetAttribLocation(pointProgram, "aPosition")
+            GLES20.glEnableVertexAttribArray(posHandle)
+            pointBuffer.position(0)
+            GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
 
-        val mvpHandle = GLES20.glGetUniformLocation(pointProgram, "uMVPMatrix")
-        GLES20.glUniformMatrix4fv(mvpHandle, 1, false, vPMatrix, 0)
+            val colorHandle = GLES20.glGetAttribLocation(pointProgram, "aColor")
+            GLES20.glEnableVertexAttribArray(colorHandle)
+            pointBuffer.position(3)
+            GLES20.glVertexAttribPointer(colorHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
 
-        if (pointCount > 0) GLES20.glDrawArrays(GLES20.GL_POINTS, 0, pointCount)
+            val mvpHandle = GLES20.glGetUniformLocation(pointProgram, "uMVPMatrix")
+            GLES20.glUniformMatrix4fv(mvpHandle, 1, false, vPMatrix, 0)
 
-        GLES20.glDisableVertexAttribArray(posHandle)
-        GLES20.glDisableVertexAttribArray(colorHandle)
+            val sizeHandle = GLES20.glGetUniformLocation(pointProgram, "uPointSize")
+            GLES20.glUniform1f(sizeHandle, pointSize)
+
+            GLES20.glDrawArrays(GLES20.GL_POINTS, 0, pointCount)
+
+            GLES20.glDisableVertexAttribArray(posHandle)
+            GLES20.glDisableVertexAttribArray(colorHandle)
+        }
     }
 }
