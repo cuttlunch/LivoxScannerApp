@@ -70,6 +70,7 @@ class LivoxUdpClient(
             val rawZ = bb.int
             val refl = bb.get().toInt() and 0xFF
             if (rawX != 0 || rawY != 0 || rawZ != 0) {
+                // Divided by 1000f to convert millimeters to meters for OpenGL space
                 points.add(Point3D(rawX / 1000f, rawY / 1000f, rawZ / 1000f, refl))
             }
         }
