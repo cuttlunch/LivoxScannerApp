@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- ASIX AX88179 / AX88179A USB 3.0 Gigabit Ethernet Adapter -->
+    <usb-device vendor-id="0x0B95" product-id="0x1790" />
+    <usb-device vendor-id="0x0B95" product-id="0x178A" />
     <usb-device class="255" subclass="255" protocol="255" />
     <usb-device class="2" />
 </resources>
