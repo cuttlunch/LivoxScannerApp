@@ -42,7 +42,37 @@ class ArPointCloudRenderer(
     var orbitAngleY = 0f
     var orbitZoom = -6f
 
-    private var program = 0
+    private var pointProgram = 0
+    private var bgProgram = 0
+
+    private val quadCoords = ByteBuffer.allocateDirect(4 * 2 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+        put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
+        position(0)
+    }
+    private val quadTexCoords = ByteBuffer.allocateDirect(4 * 2 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+        put(floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f))
+        position(0)
+    }
+
+    private val bgVertexShaderCode = """
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = aPosition;
+            vTexCoord = aTexCoord;
+        }
+    """.trimIndent()
+
+    private val bgFragmentShaderCode = """
+        #extension GL_OES_EGL_image_external : require
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform samplerExternalOES sTexture;
+        void main() {
+            gl_FragColor = texture2D(sTexture, vTexCoord);
+        }
+    """.trimIndent()
 
     private val vertexShaderCode = """
         uniform mat4 uMVPMatrix;
@@ -90,25 +120,36 @@ class ArPointCloudRenderer(
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.05f, 0.05f, 0.08f, 1.0f)
-        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
 
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         cameraTextureId = textures[0]
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
+        // Compile Background Shader
+        val bgVShader = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also {
+            GLES20.glShaderSource(it, bgVertexShaderCode); GLES20.glCompileShader(it)
+        }
+        val bgFShader = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER).also {
+            GLES20.glShaderSource(it, bgFragmentShaderCode); GLES20.glCompileShader(it)
+        }
+        bgProgram = GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it, bgVShader); GLES20.glAttachShader(it, bgFShader); GLES20.glLinkProgram(it)
+        }
+
+        // Compile Point Cloud Shader
         val vShader = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also {
-            GLES20.glShaderSource(it, vertexShaderCode)
-            GLES20.glCompileShader(it)
+            GLES20.glShaderSource(it, vertexShaderCode); GLES20.glCompileShader(it)
         }
         val fShader = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER).also {
-            GLES20.glShaderSource(it, fragmentShaderCode)
-            GLES20.glCompileShader(it)
+            GLES20.glShaderSource(it, fragmentShaderCode); GLES20.glCompileShader(it)
         }
-        program = GLES20.glCreateProgram().also {
-            GLES20.glAttachShader(it, vShader)
-            GLES20.glAttachShader(it, fShader)
-            GLES20.glLinkProgram(it)
+        pointProgram = GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it, vShader); GLES20.glAttachShader(it, fShader); GLES20.glLinkProgram(it)
         }
     }
 
@@ -128,6 +169,24 @@ class ArPointCloudRenderer(
         try {
             val frame = session.update()
             val camera = frame.camera
+
+            // 1. Draw Camera Background Feed
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            GLES20.glUseProgram(bgProgram)
+            val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPosition")
+            val bgTexLoc = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
+            GLES20.glEnableVertexAttribArray(bgPosLoc)
+            GLES20.glVertexAttribPointer(bgPosLoc, 2, GLES20.GL_FLOAT, false, 0, quadCoords)
+            GLES20.glEnableVertexAttribArray(bgTexLoc)
+            GLES20.glVertexAttribPointer(bgTexLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(bgProgram, "sTexture"), 0)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDisableVertexAttribArray(bgPosLoc)
+            GLES20.glDisableVertexAttribArray(bgTexLoc)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+
             if (camera.trackingState == TrackingState.TRACKING) {
                 fusionEngine.isTracking = true
                 fusionEngine.recordPose(System.nanoTime(), camera.pose)
@@ -161,20 +220,21 @@ class ArPointCloudRenderer(
         }
 
         Matrix.multiplyMM(vPMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
-        GLES20.glUseProgram(program)
-
+        
+        // 2. Draw Point Cloud Overlay
+        GLES20.glUseProgram(pointProgram)
         val strideBytes = 6 * 4
-        val posHandle = GLES20.glGetAttribLocation(program, "aPosition")
+        val posHandle = GLES20.glGetAttribLocation(pointProgram, "aPosition")
         GLES20.glEnableVertexAttribArray(posHandle)
         pointBuffer.position(0)
         GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
 
-        val colorHandle = GLES20.glGetAttribLocation(program, "aColor")
+        val colorHandle = GLES20.glGetAttribLocation(pointProgram, "aColor")
         GLES20.glEnableVertexAttribArray(colorHandle)
         pointBuffer.position(3)
         GLES20.glVertexAttribPointer(colorHandle, 3, GLES20.GL_FLOAT, false, strideBytes, pointBuffer)
 
-        val mvpHandle = GLES20.glGetUniformLocation(program, "uMVPMatrix")
+        val mvpHandle = GLES20.glGetUniformLocation(pointProgram, "uMVPMatrix")
         GLES20.glUniformMatrix4fv(mvpHandle, 1, false, vPMatrix, 0)
 
         if (pointCount > 0) GLES20.glDrawArrays(GLES20.GL_POINTS, 0, pointCount)
