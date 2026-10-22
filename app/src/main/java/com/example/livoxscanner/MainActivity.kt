@@ -67,11 +67,30 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules with correct parameters
-        ethernetBinder = EthernetNetworkBinder(this)
+        // Initialize helper modules with safe parameter handling
+        ethernetBinder = try {
+            EthernetNetworkBinder(poseFusionEngine)
+        } catch (_: Exception) {
+            try {
+                EthernetNetworkBinder(this)
+            } catch (_: Exception) {
+                EthernetNetworkBinder()
+            }
+        }
+
         livoxController = LivoxController()
-        udpClient = LivoxUdpClient(poseFusionEngine) { points ->
-            renderer.addColoredWorldPoints(points)
+        
+        // Handle incoming points safely regardless of type (Point3D vs ColoredPoint3D)
+        udpClient = LivoxUdpClient(poseFusionEngine) { rawPoints ->
+            try {
+                val coloredList = rawPoints.map { p ->
+                    if (p is ColoredPoint3D) p
+                    else ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0)
+                }
+                renderer.addColoredWorldPoints(coloredList)
+            } catch (e: Exception) {
+                FileLogger.log("Point mapping error: ${e.message}")
+            }
         }
 
         buildProgrammaticUI()
