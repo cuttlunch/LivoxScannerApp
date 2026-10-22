@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <usb-device class="255" subclass="255" protocol="255" />
+    <usb-device class="2" />
+</resources>
