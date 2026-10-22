@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class LivoxController(
     private val ethernetBinder: EthernetNetworkBinder,
-    private val fallbackHostIp: String = "192.168.1.50",
+    private val fallbackHostIp: String = "192.168.1.51",
     private val pointDataPort: Int = 60001,
     private val cmdPort: Int = 60002,
     private val imuPort: Int = 60003
