@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules with correct constructor arguments
+        // Initialize helper modules with exact constructor signatures
         ethernetBinder = EthernetNetworkBinder(this)
         livoxController = LivoxController()
         
@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
             requestCameraPermission()
         }
 
-        bindEthernetInterface()
+        ethernetBinder.startMonitoring()
         startStatusLoop()
     }
 
@@ -271,20 +271,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun bindEthernetInterface() {
-        try {
-            val method = ethernetBinder.javaClass.methods.find { 
-                it.name.contains("bind") || it.name.contains("setup") || it.name.contains("init") 
-            }
-            if (method != null && method.parameterTypes.isEmpty()) {
-                method.invoke(ethernetBinder)
-            }
-            FileLogger.log("EthernetNetworkBinder initialized.")
-        } catch (e: Exception) {
-            FileLogger.log("Ethernet binding notice: ${e.message}")
-        }
-    }
-
     private fun startStatusLoop() {
         val runnable = object : Runnable {
             override fun run() {
@@ -300,28 +286,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkNetworkInterfaces() {
         try {
-            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            var foundEth: String? = null
-            for (ni in interfaces) {
-                if (!ni.isUp || ni.isLoopback) continue
-                val name = ni.name.lowercase()
-                val isWiredEthernet = name.startsWith("eth") || name.startsWith("usb") || name.startsWith("enx") || name.startsWith("rndis")
-                if (!isWiredEthernet) continue
-
-                for (addr in Collections.list(ni.inetAddresses)) {
-                    val host = addr.hostAddress ?: continue
-                    if (host.indexOf(':') < 0) { // IPv4 only
-                        foundEth = "$name: $host"
-                    }
-                }
-            }
-            val newIp = foundEth ?: "Disconnected"
-            if (newIp != ethIp) {
-                ethIp = newIp
-                FileLogger.log("Wired network status changed: $ethIp")
-            }
+            val ip = ethernetBinder.localEthernetIp.value
+            ethIp = ip ?: "Disconnected"
         } catch (e: Exception) {
-            FileLogger.log("Network check error: ${e.message}")
+            ethIp = "Disconnected"
         }
     }
 
@@ -391,5 +359,10 @@ class MainActivity : AppCompatActivity() {
         glSurfaceView.onPause()
         arSession?.pause()
         FileLogger.log("onPause: paused.")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ethernetBinder.stopMonitoring()
     }
 }
