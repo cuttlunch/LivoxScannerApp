@@ -1,12 +1,17 @@
 package com.example.livoxscanner
 
 import android.Manifest
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.hardware.usb.UsbManager
 import android.opengl.GLSurfaceView
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.MotionEvent
@@ -43,6 +48,25 @@ class MainActivity : AppCompatActivity() {
     private var prevX = 0f
     private var prevY = 0f
 
+    companion object {
+        private const val ACTION_USB_PERMISSION = "com.example.livoxscanner.USB_PERMISSION"
+    }
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (ACTION_USB_PERMISSION == intent?.action) {
+                synchronized(this) {
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (granted) {
+                        Toast.makeText(context, "USB Accessory Permission Granted!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "USB Permission Denied", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -51,6 +75,8 @@ class MainActivity : AppCompatActivity() {
         ) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 101)
         }
+
+        checkAndRequestUsbPermission()
 
         val prefs = getSharedPreferences("livox_calib", Context.MODE_PRIVATE)
         fusionEngine.setBoreSightAngles(
@@ -75,6 +101,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         setContentView(buildScannerHud())
+    }
+
+    private fun checkAndRequestUsbPermission() {
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        val deviceList = usbManager.deviceList ?: return
+        if (deviceList.isEmpty()) return
+
+        for (device in deviceList.values) {
+            if (!usbManager.hasPermission(device)) {
+                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                } else {
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                }
+                val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), flags)
+                val filter = IntentFilter(ACTION_USB_PERMISSION)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(usbReceiver, filter, RECEIVER_EXPORTED)
+                } else {
+                    registerReceiver(usbReceiver, filter)
+                }
+                usbManager.requestPermission(device, permissionIntent)
+            }
+        }
     }
 
     private fun buildScannerHud(): View {
@@ -102,7 +152,7 @@ class MainActivity : AppCompatActivity() {
                 val ethIp = ethernetBinder.localEthernetIp.value ?: "Disconnected"
                 val arState = if (fusionEngine.isTracking) "TRACKING" else "WAIT"
                 val ptsK = String.format("%.1fk", renderer.pointCount / 1000f)
-                statusText.text = "â— eth0: $ethIp   |   AR: $arState   |   $ptsK voxels"
+                statusText.text = "● eth0: $ethIp   |   AR: $arState   |   $ptsK voxels"
                 delay(200)
             }
         }
@@ -217,7 +267,7 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 textSize = 13f
                 width = 230
-                text = "$label: ${String.format("%+.1fÂ°", initialAngle)}"
+                text = "$label: ${String.format("%+.1f°", initialAngle)}"
             }
             val seekBar = SeekBar(this).apply {
                 max = 200
@@ -226,7 +276,7 @@ class MainActivity : AppCompatActivity() {
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                         val deg = (progress - 100) / 10f
-                        valueLabel.text = "$label: ${String.format("%+.1fÂ°", deg)}"
+                        valueLabel.text = "$label: ${String.format("%+.1f°", deg)}"
                         if (fromUser) {
                             onAngleChanged(deg)
                             renderer.clearPoints()
@@ -261,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnReset = Button(this).apply {
-            text = "Reset Angles to 0.0Â°"
+            text = "Reset Angles to 0.0°"
             setTextColor(Color.WHITE)
             textSize = 12f
             background = roundedBg(Color.parseColor("#37474F"), 18f)
@@ -368,5 +418,6 @@ class MainActivity : AppCompatActivity() {
         livoxClient.stopListening()
         ethernetBinder.stopMonitoring()
         arSession?.close()
+        runCatching { unregisterReceiver(usbReceiver) }
     }
 }
