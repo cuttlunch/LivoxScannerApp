@@ -174,29 +174,28 @@ class MainActivity : AppCompatActivity() {
             background = roundedBg(Color.parseColor("#CC12141C"), 32f)
         }
 
-     val btnScan = styledButton("Start Scan", Color.parseColor("#00C853")).apply {
-    setOnClickListener {
-        if (!isScanning) {
-            isScanning = true
-            text = "Stop Scan"
-            background = roundedBg(Color.parseColor("#D50000"), 24f)
-            
-            // Force assign static IP fallback if OS hasn't initialized eth0 yet
-            if (ethernetBinder.localEthernetIp.value == null) {
-                Toast.init
+    val btnScan = styledButton("Start Scan", Color.parseColor("#00C853")).apply {
+            setOnClickListener {
+                if (!isScanning) {
+                    isScanning = true
+                    text = "Stop Scan"
+                    background = roundedBg(Color.parseColor("#D50000"), 24f)
+                    
+                    if (ethernetBinder.localEthernetIp.value == null) {
+                        Toast.makeText(context, "Using static IP fallback (192.168.1.50)", Toast.LENGTH_SHORT).show()
+                    }
+                    
+                    livoxClient.startListening(lifecycleScope)
+                    livoxController.connectAndStartLaser(lifecycleScope)
+                    Toast.makeText(context, "Initiating Livox Mid-40 stream...", Toast.LENGTH_SHORT).show()
+                } else {
+                    isScanning = false
+                    text = "Start Scan"
+                    background = roundedBg(Color.parseColor("#00C853"), 24f)
+                    livoxClient.stopListening()
+                }
             }
-            
-            livoxClient.startListening(lifecycleScope)
-            livoxController.connectAndStartLaser(lifecycleScope)
-            Toast.makeText(context, "Initiating Livox Mid-40 stream...", Toast.LENGTH_SHORT).show()
-        } else {
-            isScanning = false
-            text = "Start Scan"
-            background = roundedBg(Color.parseColor("#00C853"), 24f)
-            livoxClient.stopListening()
         }
-    }
-}
 
         val btnOrbit = styledButton("3D Orbit", Color.parseColor("#2962FF")).apply {
             setOnClickListener {
