@@ -36,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var renderer: ArPointCloudRenderer
     private lateinit var poseFusionEngine: PoseFusionEngine
     private lateinit var colorizer: CameraColorizer
+    private lateinit var voxelFilter: VoxelGridFilter
 
     private var arSession: Session? = null
     private val isScanning = AtomicBoolean(false)
@@ -62,8 +63,9 @@ class MainActivity : AppCompatActivity() {
         FileLogger.init(this)
         FileLogger.log("=== MainActivity Started ===")
 
-        poseFusionEngine = PoseFusionEngine()
         colorizer = CameraColorizer()
+        voxelFilter = VoxelGridFilter()
+        poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
         // Build the entire UI in Kotlin (Zero XML or R.id dependencies)
@@ -239,22 +241,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Logs incoming Livox UDP packets on port 56000 (point data) & 55000 (broadcast)
-     * and invokes LivoxUdpDriver via reflection if present in your package.
-     */
     private fun startUdpDiagnosticListener() {
         if (udpListening.getAndSet(true)) return
 
-        // Try starting your project's Livox driver class if it exists
-        try {
-            val driverClass = Class.forName("com.example.livoxscanner.LivoxUdpDriver")
-            FileLogger.log("Found LivoxUdpDriver class in package.")
-        } catch (e: ClassNotFoundException) {
-            FileLogger.log("Note: LivoxUdpDriver class not found by that exact name; using built-in UDP sniffer.")
-        }
-
-        // Thread to monitor port 56000 (Livox Mid-40 Point Cloud UDP port)
         Thread {
             var socket: DatagramSocket? = null
             try {
