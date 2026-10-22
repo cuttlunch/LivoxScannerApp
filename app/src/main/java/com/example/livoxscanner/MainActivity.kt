@@ -277,14 +277,19 @@ class MainActivity : AppCompatActivity() {
         uiHandler.post(runnable)
     }
 
-    private fun checkNetworkInterfaces() {
-        try {
-            val ip = ethernetBinder.localEthernetIp.value
-            ethIp = ip ?: "Disconnected"
-        } catch (e: Exception) {
-            ethIp = "Disconnected"
+private fun checkNetworkInterfaces() {
+    try {
+        val activeNetwork = ethernetBinder.ethernetNetwork.value
+        val ip = ethernetBinder.localEthernetIp.value
+        ethIp = if (activeNetwork != null && ip != null) {
+            ip
+        } else {
+            "Disconnected"
         }
+    } catch (e: Exception) {
+        ethIp = "Disconnected"
     }
+}
 
     private fun setupARSession() {
         try {
