@@ -25,6 +25,8 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.net.NetworkInterface
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
@@ -69,7 +71,6 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules with exact constructor requirements
         ethernetBinder = EthernetNetworkBinder(this)
         livoxController = LivoxController(ethernetBinder)
         
@@ -267,6 +268,8 @@ class MainActivity : AppCompatActivity() {
     private fun startStatusLoop() {
         val runnable = object : Runnable {
             override fun run() {
+                @Suppress("DEPRECATION")
+                renderer.displayRotation = windowManager.defaultDisplay.rotation
                 checkNetworkInterfaces()
                 val arState = if (poseFusionEngine.isTracking) "TRACKING" else "WAIT"
                 val kVoxels = String.format("%.1fk", renderer.pointCount / 1000f)
@@ -277,19 +280,38 @@ class MainActivity : AppCompatActivity() {
         uiHandler.post(runnable)
     }
 
-private fun checkNetworkInterfaces() {
-    try {
-        val activeNetwork = ethernetBinder.ethernetNetwork.value
-        val ip = ethernetBinder.localEthernetIp.value
-        ethIp = if (activeNetwork != null && ip != null) {
-            ip
-        } else {
-            "Disconnected"
+    private fun checkNetworkInterfaces() {
+        try {
+            // Check physical network interfaces first so fallback static strings don't fake a connection
+            var foundWiredIp: String? = null
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            for (ni in interfaces) {
+                if (!ni.isUp || ni.isLoopback) continue
+                val name = ni.name.lowercase()
+                val isWired = name.startsWith("eth") || name.startsWith("usb") || name.startsWith("enx") || name.startsWith("rndis")
+                if (!isWired) continue
+
+                for (addr in Collections.list(ni.inetAddresses)) {
+                    val host = addr.hostAddress ?: continue
+                    if (!host.contains(':')) {
+                        foundWiredIp = host
+                        break
+                    }
+                }
+            }
+
+            val activeOsNetwork = ethernetBinder.ethernetNetwork.value
+            val binderIp = ethernetBinder.localEthernetIp.value
+
+            ethIp = when {
+                foundWiredIp != null -> foundWiredIp
+                activeOsNetwork != null && binderIp != null -> binderIp
+                else -> "Disconnected"
+            }
+        } catch (e: Exception) {
+            ethIp = "Disconnected"
         }
-    } catch (e: Exception) {
-        ethIp = "Disconnected"
     }
-}
 
     private fun setupARSession() {
         try {
