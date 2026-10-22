@@ -12,7 +12,9 @@ import kotlinx.coroutines.flow.StateFlow
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.SocketAddress
+import java.util.Collections
 
 class EthernetNetworkBinder(private val context: Context) {
     private val connectivityManager =
@@ -71,15 +73,15 @@ class EthernetNetworkBinder(private val context: Context) {
 
     fun createBoundUdpSocket(localPort: Int): DatagramSocket {
         val network = _ethernetNetwork.value
-        
-        // FALLBACK: If Android OS hasn't bound eth0 yet because the Mid-40 has no DHCP server,
-        // create a standard unbound socket on 192.168.1.50 so UDP packets can still flow.
+
         if (network == null) {
-            Log.w("EthernetBinder", "Active eth0 network handle missing. Binding to wildcard with static IP fallback.")
+            Log.w("EthernetBinder", "Active network handle missing. Binding to wildcard socket.")
             val socket = DatagramSocket(null as SocketAddress?)
             socket.reuseAddress = true
             socket.bind(InetSocketAddress(localPort))
-            _localEthernetIp.value = "192.168.1.51"
+            
+            // Dynamically grab the device's active local IP (e.g. Wi-Fi IP) instead of a hardcoded fake static IP
+            _localEthernetIp.value = getLocalIpAddress()
             return socket
         }
 
@@ -88,5 +90,22 @@ class EthernetNetworkBinder(private val context: Context) {
         network.bindSocket(socket)
         socket.bind(InetSocketAddress(localPort))
         return socket
+    }
+
+    private fun getLocalIpAddress(): String? {
+        try {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            for (ni in interfaces) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (addr in Collections.list(ni.inetAddresses)) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        return addr.hostAddress
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("EthernetBinder", "Error fetching local IP: ${e.message}")
+        }
+        return null
     }
 }
