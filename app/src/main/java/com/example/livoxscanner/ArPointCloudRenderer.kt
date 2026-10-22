@@ -4,6 +4,8 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import android.view.Surface
+import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -21,6 +23,13 @@ class ArPointCloudRenderer(
     var arSession: Session? = null
     private var cameraTextureId = -1
     private var frameCounter = 0
+
+    @Volatile var displayRotation: Int = Surface.ROTATION_0
+    private var viewportWidth = 0
+    private var viewportHeight = 0
+    private var lastAppliedRotation = -1
+    private var lastAppliedWidth = -1
+    private var lastAppliedHeight = -1
 
     private val maxPoints = 1_500_000
     private val pointBuffer: FloatBuffer = ByteBuffer
@@ -45,14 +54,35 @@ class ArPointCloudRenderer(
     private var pointProgram = 0
     private var bgProgram = 0
 
-    private val quadCoords = ByteBuffer.allocateDirect(4 * 2 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
-        put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
-        position(0)
-    }
-    private val quadTexCoords = ByteBuffer.allocateDirect(4 * 2 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
-        put(floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f))
-        position(0)
-    }
+    // Normalized Device Coordinates (NDC) for full-screen quad
+    private val quadCoords: FloatBuffer = ByteBuffer
+        .allocateDirect(4 * 2 * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(floatArrayOf(
+                -1f, -1f,
+                 1f, -1f,
+                -1f,  1f,
+                 1f,  1f
+            ))
+            position(0)
+        }
+
+    // Dynamically transformed UV coordinates populated by ARCore
+    private val transformedTexCoords: FloatBuffer = ByteBuffer
+        .allocateDirect(4 * 2 * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(floatArrayOf(
+                0f, 1f,
+                1f, 1f,
+                0f, 0f,
+                1f, 0f
+            ))
+            position(0)
+        }
 
     private val bgVertexShaderCode = """
         attribute vec4 aPosition;
@@ -130,7 +160,6 @@ class ArPointCloudRenderer(
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        // Compile Background Shader
         val bgVShader = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also {
             GLES20.glShaderSource(it, bgVertexShaderCode); GLES20.glCompileShader(it)
         }
@@ -141,7 +170,6 @@ class ArPointCloudRenderer(
             GLES20.glAttachShader(it, bgVShader); GLES20.glAttachShader(it, bgFShader); GLES20.glLinkProgram(it)
         }
 
-        // Compile Point Cloud Shader
         val vShader = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER).also {
             GLES20.glShaderSource(it, vertexShaderCode); GLES20.glCompileShader(it)
         }
@@ -155,9 +183,10 @@ class ArPointCloudRenderer(
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
+        viewportWidth = width
+        viewportHeight = height
         val ratio = width.toFloat() / height.toFloat()
         Matrix.frustumM(projectionMatrix, 0, -ratio * 0.1f, ratio * 0.1f, -0.1f, 0.1f, 0.1f, 100f)
-        arSession?.setDisplayGeometry(0, width, height)
     }
 
     @Synchronized
@@ -166,19 +195,49 @@ class ArPointCloudRenderer(
         val session = arSession ?: return
         if (cameraTextureId != -1) session.setCameraTextureName(cameraTextureId)
 
+        // Ensure ARCore always has the exact display dimensions and rotation
+        if (viewportWidth > 0 && viewportHeight > 0) {
+            if (displayRotation != lastAppliedRotation ||
+                viewportWidth != lastAppliedWidth ||
+                viewportHeight != lastAppliedHeight
+            ) {
+                session.setDisplayGeometry(displayRotation, viewportWidth, viewportHeight)
+                lastAppliedRotation = displayRotation
+                lastAppliedWidth = viewportWidth
+                lastAppliedHeight = viewportHeight
+            }
+        }
+
         try {
             val frame = session.update()
             val camera = frame.camera
 
-            // 1. Draw Camera Background Feed
+            // Ask ARCore to recalculate camera texture UVs when display geometry changes
+            if (frame.hasDisplayGeometryChanged()) {
+                quadCoords.position(0)
+                transformedTexCoords.position(0)
+                frame.transformCoordinates2d(
+                    Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
+                    quadCoords,
+                    Coordinates2d.TEXTURE_NORMALIZED,
+                    transformedTexCoords
+                )
+            }
+
+            // 1. Draw Upright, Aspect-Corrected Camera Background Feed
             GLES20.glDisable(GLES20.GL_DEPTH_TEST)
             GLES20.glUseProgram(bgProgram)
             val bgPosLoc = GLES20.glGetAttribLocation(bgProgram, "aPosition")
             val bgTexLoc = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
+            
+            quadCoords.position(0)
             GLES20.glEnableVertexAttribArray(bgPosLoc)
             GLES20.glVertexAttribPointer(bgPosLoc, 2, GLES20.GL_FLOAT, false, 0, quadCoords)
+            
+            transformedTexCoords.position(0)
             GLES20.glEnableVertexAttribArray(bgTexLoc)
-            GLES20.glVertexAttribPointer(bgTexLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+            GLES20.glVertexAttribPointer(bgTexLoc, 2, GLES20.GL_FLOAT, false, 0, transformedTexCoords)
+            
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
             GLES20.glUniform1i(GLES20.glGetUniformLocation(bgProgram, "sTexture"), 0)
