@@ -1,5 +1,6 @@
 package com.example.livoxscanner
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
@@ -69,8 +70,13 @@ class LivoxUdpClient(
             val rawY = bb.int
             val rawZ = bb.int
             val refl = bb.get().toInt() and 0xFF
+
+            // Log the first point of the packet to verify raw millimeter values
+            if (i == 0) {
+                Log.d("LivoxRaw", "Raw[0]: X=$rawX, Y=$rawY, Z=$rawZ (mm)")
+            }
+
             if (rawX != 0 || rawY != 0 || rawZ != 0) {
-                // Divided by 1000f to convert millimeters to meters for OpenGL space
                 points.add(Point3D(rawX / 1000f, rawY / 1000f, rawZ / 1000f, refl))
             }
         }
