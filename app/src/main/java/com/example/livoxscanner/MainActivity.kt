@@ -22,13 +22,9 @@ import androidx.core.content.ContextCompat
 import com.google.ar.core.Config
 import com.google.ar.core.Session
 import com.google.ar.core.exceptions.CameraNotAvailableException
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : AppCompatActivity() {
 
@@ -40,15 +36,18 @@ class MainActivity : AppCompatActivity() {
 
     private var arSession: Session? = null
     private val isScanning = AtomicBoolean(false)
-    private val udpListening = AtomicBoolean(false)
-    private val packetCount = AtomicLong(0)
+
+    // Project components
+    private lateinit var ethernetBinder: EthernetNetworkBinder
+    private lateinit var livoxController: LivoxController
+    private lateinit var udpClient: LivoxUdpClient
 
     private lateinit var statusText: TextView
     private lateinit var btnScanToggle: Button
     private lateinit var btnOrbitToggle: Button
 
     private val uiHandler = Handler(Looper.getMainLooper())
-    private var ethIp: String = "No eth0"
+    private var ethIp: String = "Disconnected"
 
     private var prevTouchX = 0f
     private var prevTouchY = 0f
@@ -68,7 +67,11 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Build the entire UI in Kotlin (Zero XML or R.id dependencies)
+        // Initialize helper modules
+        ethernetBinder = EthernetNetworkBinder(this)
+        livoxController = LivoxController()
+        udpClient = LivoxUdpClient(poseFusionEngine, renderer)
+
         buildProgrammaticUI()
 
         if (checkCameraPermission()) {
@@ -77,7 +80,7 @@ class MainActivity : AppCompatActivity() {
             requestCameraPermission()
         }
 
-        checkNetworkInterfaces()
+        bindEthernetInterface()
         startStatusLoop()
     }
 
@@ -86,7 +89,6 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        // 1. OpenGL Surface View for AR Camera & Point Cloud
         glSurfaceView = object : GLSurfaceView(this) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
                 if (!renderer.followArCamera) {
@@ -123,9 +125,8 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
-        // 2. Top Status Pill ("• eth0: 192.168.1.50 | AR: TRACKING | 0.0k voxels")
         statusText = TextView(this).apply {
-            text = "• eth0: checking...  |  AR: WAIT  |  0.0k voxels"
+            text = "• eth0: Disconnected  |  AR: WAIT  |  0.0k voxels"
             setTextColor(Color.WHITE)
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
@@ -144,7 +145,6 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(statusText, topParams)
 
-        // 3. Bottom Control Bar
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -230,54 +230,38 @@ class MainActivity : AppCompatActivity() {
 
         if (nowScanning) {
             btnScanToggle.text = "Stop Scan"
-            updateButtonColor(btnScanToggle, "#C62828") // Red
-            FileLogger.log("SCAN STARTED. eth0=$ethIp, AR_Tracking=${poseFusionEngine.isTracking}")
-            startUdpDiagnosticListener()
+            updateButtonColor(btnScanToggle, "#C62828")
+            FileLogger.log("SCAN STARTED. Initiating Livox UDP client and controller.")
+            
+            // Start UDP listening & LiDAR handshake control
+            udpClient.start()
+            livoxController.startScanning()
+            Toast.makeText(this, "Livox scanning started", Toast.LENGTH_SHORT).show()
         } else {
             btnScanToggle.text = "Start Scan"
-            updateButtonColor(btnScanToggle, "#2E7D32") // Green
-            FileLogger.log("SCAN STOPPED. Total UDP packets seen=${packetCount.get()}, Voxels=${renderer.pointCount}")
-            udpListening.set(false)
+            updateButtonColor(btnScanToggle, "#2E7D32")
+            FileLogger.log("SCAN STOPPED. Total Voxels=${renderer.pointCount}")
+            
+            udpClient.stop()
+            livoxController.stopScanning()
+            Toast.makeText(this, "Livox scanning stopped", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun startUdpDiagnosticListener() {
-        if (udpListening.getAndSet(true)) return
-
-        Thread {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket(null).apply {
-                    reuseAddress = true
-                    soTimeout = 2000
-                    bind(InetSocketAddress(56000))
-                }
-                FileLogger.log("UDP Listener bound to port 56000.")
-                val buf = ByteArray(1500)
-                val packet = DatagramPacket(buf, buf.size)
-
-                while (udpListening.get()) {
-                    try {
-                        socket.receive(packet)
-                        val count = packetCount.incrementAndGet()
-                        if (count == 1L || count % 200L == 0L) {
-                            FileLogger.log("UDP 56000 rx: packet #$count (${packet.length} bytes) from ${packet.address.hostAddress}")
-                        }
-                    } catch (_: java.net.SocketTimeoutException) {
-                        FileLogger.log("UDP 56000 timeout: 0 packets received in last 2s. Check LiDAR handshake/port.")
-                    }
-                }
-            } catch (e: Exception) {
-                FileLogger.log("UDP 56000 bind/receive error: ${e.javaClass.simpleName} - ${e.message}")
-            } finally {
-                socket?.close()
-            }
-        }.start()
+    private fun bindEthernetInterface() {
+        try {
+            ethernetBinder.bindToEthernet()
+            FileLogger.log("EthernetNetworkBinder executed successfully.")
+        } catch (e: Exception) {
+            FileLogger.log("Ethernet binding error: ${e.message}")
+        }
     }
 
     private fun startStatusLoop() {
         val runnable = object : Runnable {
             override fun run() {
+                @Suppress("DEPRECATION")
+                renderer.displayRotation = windowManager.defaultDisplay.rotation
                 checkNetworkInterfaces()
                 val arState = if (poseFusionEngine.isTracking) "TRACKING" else "WAIT"
                 val kVoxels = String.format("%.1fk", renderer.pointCount / 1000f)
@@ -294,19 +278,21 @@ class MainActivity : AppCompatActivity() {
             var foundEth: String? = null
             for (ni in interfaces) {
                 if (!ni.isUp || ni.isLoopback) continue
+                val name = ni.name.lowercase()
+                val isWiredEthernet = name.startsWith("eth") || name.startsWith("usb") || name.startsWith("enx") || name.startsWith("rndis")
+                if (!isWiredEthernet) continue
+
                 for (addr in Collections.list(ni.inetAddresses)) {
                     val host = addr.hostAddress ?: continue
-                    if (host.indexOf(':') < 0) { // IPv4
-                        if (ni.name.startsWith("eth") || ni.name.startsWith("usb") || host.startsWith("192.168.1.")) {
-                            foundEth = host
-                        }
+                    if (host.indexOf(':') < 0) { // IPv4 only
+                        foundEth = "$name: $host"
                     }
                 }
             }
             val newIp = foundEth ?: "Disconnected"
             if (newIp != ethIp) {
                 ethIp = newIp
-                FileLogger.log("Network status changed: eth0 = $ethIp")
+                FileLogger.log("Wired network status changed: $ethIp")
             }
         } catch (e: Exception) {
             FileLogger.log("Network check error: ${e.message}")
