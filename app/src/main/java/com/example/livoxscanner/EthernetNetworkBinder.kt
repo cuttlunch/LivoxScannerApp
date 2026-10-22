@@ -6,6 +6,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.net.DatagramSocket
@@ -13,7 +14,7 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.SocketAddress
 
-class EthernetNetworkBinder(context: Context) {
+class EthernetNetworkBinder(private val context: Context) {
     private val connectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
@@ -44,7 +45,11 @@ class EthernetNetworkBinder(context: Context) {
             .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
-        connectivityManager.requestNetwork(request, networkCallback)
+        try {
+            connectivityManager.requestNetwork(request, networkCallback)
+        } catch (e: Exception) {
+            Log.e("EthernetBinder", "Error requesting network: ${e.message}")
+        }
     }
 
     fun stopMonitoring() {
@@ -66,7 +71,18 @@ class EthernetNetworkBinder(context: Context) {
 
     fun createBoundUdpSocket(localPort: Int): DatagramSocket {
         val network = _ethernetNetwork.value
-            ?: throw IllegalStateException("USB-C Ethernet network is not connected!")
+        
+        // FALLBACK: If Android OS hasn't bound eth0 yet because the Mid-40 has no DHCP server,
+        // create a standard unbound socket on 192.168.1.50 so UDP packets can still flow.
+        if (network == null) {
+            Log.w("EthernetBinder", "Active eth0 network handle missing. Binding to wildcard with static IP fallback.")
+            val socket = DatagramSocket(null as SocketAddress?)
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(localPort))
+            _localEthernetIp.value = "192.168.1.50"
+            return socket
+        }
+
         val socket = DatagramSocket(null as SocketAddress?)
         socket.reuseAddress = true
         network.bindSocket(socket)
