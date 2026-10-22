@@ -67,10 +67,12 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules
+        // Initialize helper modules with correct parameters
         ethernetBinder = EthernetNetworkBinder(this)
         livoxController = LivoxController()
-        udpClient = LivoxUdpClient(poseFusionEngine, renderer)
+        udpClient = LivoxUdpClient(poseFusionEngine) { points ->
+            renderer.addColoredWorldPoints(points)
+        }
 
         buildProgrammaticUI()
 
