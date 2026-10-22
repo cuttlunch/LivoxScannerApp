@@ -79,7 +79,7 @@ class EthernetNetworkBinder(private val context: Context) {
             val socket = DatagramSocket(null as SocketAddress?)
             socket.reuseAddress = true
             socket.bind(InetSocketAddress(localPort))
-            _localEthernetIp.value = "192.168.1.50"
+            _localEthernetIp.value = "192.168.1.51"
             return socket
         }
 
