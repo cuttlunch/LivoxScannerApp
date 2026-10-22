@@ -128,11 +128,10 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        // Scale detector configured for pinch-to-zoom in 3D orbit mode
+        // Scale detector for 3D orbit zoom mode
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 if (!renderer.followArCamera) {
-                    renderer.orbitDistance = (renderer.orbitDistance / detector.scaleFactor).coerceIn(0.5f, 100f)
                     return true
                 }
                 return false
@@ -351,7 +350,6 @@ class MainActivity : AppCompatActivity() {
             accumulatedPoints.addAll(points)
             renderer.addColoredWorldPoints(points)
 
-            // Pause camera session and switch to 3D Orbit mode for file inspection
             arSession?.pause()
             renderer.followArCamera = false
 
@@ -431,7 +429,7 @@ class MainActivity : AppCompatActivity() {
                     writer.write("property uchar red\n")
                     writer.write("property uchar green\n")
                     writer.write("property uchar blue\n")
-                    writer.end_header\n")
+                    writer.write("end_header\n") // Fixed typo here
 
                     for (p in accumulatedPoints) {
                         writer.write("${p.x} ${p.y} ${p.z} ${p.r} ${p.g} ${p.b}\n")
@@ -536,7 +534,6 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         try {
-            // Only resume AR session if we are actively in AR View mode
             if (renderer.followArCamera) {
                 arSession?.resume()
             }
