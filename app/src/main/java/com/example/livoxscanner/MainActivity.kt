@@ -128,9 +128,11 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
+        // Scale detector configured for pinch-to-zoom in 3D orbit mode
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 if (!renderer.followArCamera) {
+                    renderer.orbitDistance = (renderer.orbitDistance / detector.scaleFactor).coerceIn(0.5f, 100f)
                     return true
                 }
                 return false
@@ -217,9 +219,19 @@ class MainActivity : AppCompatActivity() {
 
         btnOrbitToggle = createScrollableButton("3D Orbit", "#1565C0") {
             renderer.followArCamera = !renderer.followArCamera
-            val mode = if (renderer.followArCamera) "AR View" else "3D Orbit"
-            FileLogger.log("Camera mode switched to: $mode")
-            Toast.makeText(this, "Mode: $mode", Toast.LENGTH_SHORT).show()
+            if (renderer.followArCamera) {
+                try {
+                    arSession?.resume()
+                    FileLogger.log("Camera mode switched to: AR View (Camera Resumed)")
+                    Toast.makeText(this, "Mode: AR View", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    FileLogger.log("Failed to resume AR session: ${e.message}")
+                }
+            } else {
+                arSession?.pause()
+                FileLogger.log("Camera mode switched to: 3D Orbit (Camera Paused)")
+                Toast.makeText(this, "Mode: 3D Orbit (Camera Off)", Toast.LENGTH_SHORT).show()
+            }
         }
 
         val btnCalibrate = createScrollableButton("Calibrate", "#455A64") {
@@ -339,10 +351,12 @@ class MainActivity : AppCompatActivity() {
             accumulatedPoints.addAll(points)
             renderer.addColoredWorldPoints(points)
 
+            // Pause camera session and switch to 3D Orbit mode for file inspection
+            arSession?.pause()
             renderer.followArCamera = false
 
-            FileLogger.log("Successfully loaded ${points.size} points from PLY file.")
-            Toast.makeText(this, "Loaded ${points.size} points (3D Orbit Mode)", Toast.LENGTH_LONG).show()
+            FileLogger.log("Successfully loaded ${points.size} points from PLY file (Camera Paused).")
+            Toast.makeText(this, "Loaded ${points.size} points (Camera Off)", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             FileLogger.log("Failed to load PLY file: ${e.message}")
             Toast.makeText(this, "Error loading file: ${e.message}", Toast.LENGTH_LONG).show()
@@ -417,7 +431,7 @@ class MainActivity : AppCompatActivity() {
                     writer.write("property uchar red\n")
                     writer.write("property uchar green\n")
                     writer.write("property uchar blue\n")
-                    writer.write("end_header\n")
+                    writer.end_header\n")
 
                     for (p in accumulatedPoints) {
                         writer.write("${p.x} ${p.y} ${p.z} ${p.r} ${p.g} ${p.b}\n")
@@ -522,9 +536,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         try {
-            arSession?.resume()
+            // Only resume AR session if we are actively in AR View mode
+            if (renderer.followArCamera) {
+                arSession?.resume()
+            }
             glSurfaceView.onResume()
-            FileLogger.log("onResume: ARSession & GLSurfaceView resumed.")
+            FileLogger.log("onResume: GLSurfaceView resumed.")
         } catch (e: CameraNotAvailableException) {
             FileLogger.log("onResume CameraNotAvailableException: ${e.message}")
             arSession = null
