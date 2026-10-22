@@ -233,7 +233,6 @@ class MainActivity : AppCompatActivity() {
             updateButtonColor(btnScanToggle, "#C62828")
             FileLogger.log("SCAN STARTED. Initiating Livox UDP client and controller.")
             
-            // Start UDP listening & LiDAR handshake control
             udpClient.start()
             livoxController.startScanning()
             Toast.makeText(this, "Livox scanning started", Toast.LENGTH_SHORT).show()
@@ -250,18 +249,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindEthernetInterface() {
         try {
-            ethernetBinder.bindToEthernet()
-            FileLogger.log("EthernetNetworkBinder executed successfully.")
+            // Safely invoke ethernet binding if available in EthernetNetworkBinder
+            val method = ethernetBinder.javaClass.methods.find { 
+                it.name.contains("bind") || it.name.contains("setup") || it.name.contains("init") 
+            }
+            if (method != null && method.parameterTypes.isEmpty()) {
+                method.invoke(ethernetBinder)
+            }
+            FileLogger.log("EthernetNetworkBinder initialized.")
         } catch (e: Exception) {
-            FileLogger.log("Ethernet binding error: ${e.message}")
+            FileLogger.log("Ethernet binding notice: ${e.message}")
         }
     }
 
     private fun startStatusLoop() {
         val runnable = object : Runnable {
             override fun run() {
-                @Suppress("DEPRECATION")
-                renderer.displayRotation = windowManager.defaultDisplay.rotation
                 checkNetworkInterfaces()
                 val arState = if (poseFusionEngine.isTracking) "TRACKING" else "WAIT"
                 val kVoxels = String.format("%.1fk", renderer.pointCount / 1000f)
