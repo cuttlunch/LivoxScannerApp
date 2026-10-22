@@ -25,8 +25,6 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import java.net.NetworkInterface
-import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
@@ -71,20 +69,24 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules with exact constructor signatures
+        // Initialize helper modules with exact constructor requirements
         ethernetBinder = EthernetNetworkBinder(this)
-        livoxController = LivoxController()
+        livoxController = LivoxController(ethernetBinder)
         
-        udpClient = LivoxUdpClient(ethernetBinder, 60001) { pointList ->
-            try {
-                val coloredList = pointList.map { p ->
-                    ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
+        udpClient = LivoxUdpClient(
+            ethernetBinder = ethernetBinder,
+            pointDataPort = 60001,
+            onPointsReceived = { pointList ->
+                try {
+                    val coloredList = pointList.map { p ->
+                        ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
+                    }
+                    renderer.addColoredWorldPoints(coloredList)
+                } catch (e: Exception) {
+                    FileLogger.log("Point mapping error: ${e.message}")
                 }
-                renderer.addColoredWorldPoints(coloredList)
-            } catch (e: Exception) {
-                FileLogger.log("Point mapping error: ${e.message}")
             }
-        }
+        )
 
         buildProgrammaticUI()
 
@@ -248,11 +250,7 @@ class MainActivity : AppCompatActivity() {
             FileLogger.log("SCAN STARTED.")
             
             udpClient.startListening(activityScope)
-            
-            try {
-                val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("start") }
-                m?.invoke(livoxController)
-            } catch (_: Exception) {}
+            livoxController.connectAndStartLaser(activityScope)
 
             Toast.makeText(this, "Livox scanning started", Toast.LENGTH_SHORT).show()
         } else {
@@ -261,11 +259,6 @@ class MainActivity : AppCompatActivity() {
             FileLogger.log("SCAN STOPPED. Total Voxels=${renderer.pointCount}")
             
             udpClient.stopListening()
-            
-            try {
-                val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("stop") }
-                m?.invoke(livoxController)
-            } catch (_: Exception) {}
 
             Toast.makeText(this, "Livox scanning stopped", Toast.LENGTH_SHORT).show()
         }
