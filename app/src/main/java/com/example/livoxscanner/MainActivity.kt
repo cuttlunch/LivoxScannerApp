@@ -16,8 +16,10 @@ import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -192,37 +194,48 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(statusText, topParams)
 
+        // Scrollable container to hold all 6 control buttons comfortably
+        val horizontalScroll = HorizontalScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isHorizontalScrollBarEnabled = false
+        }
+
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(8, 32, 8, 32)
+            setPadding(12, 24, 12, 24)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#D912121A"))
                 cornerRadius = 36f
             }
         }
 
-        btnScanToggle = createStyledButton("Scan", "#2E7D32") {
+        btnScanToggle = createScrollableButton("Scan", "#2E7D32") {
             toggleScan()
         }
 
-        btnOrbitToggle = createStyledButton("3D Orbit", "#1565C0") {
+        btnOrbitToggle = createScrollableButton("3D Orbit", "#1565C0") {
             renderer.followArCamera = !renderer.followArCamera
             val mode = if (renderer.followArCamera) "AR View" else "3D Orbit"
             FileLogger.log("Camera mode switched to: $mode")
             Toast.makeText(this, "Mode: $mode", Toast.LENGTH_SHORT).show()
         }
 
-        val btnOpen = createStyledButton("Open", "#673AB7") {
-            // Launch file picker to select .ply files
+        val btnCalibrate = createScrollableButton("Calibrate", "#455A64") {
+            FileLogger.log("User pressed Calibrate.")
+            Toast.makeText(this, "Calibrating extrinsic pose...", Toast.LENGTH_SHORT).show()
+        }
+
+        val btnOpen = createScrollableButton("Open", "#673AB7") {
             openPlyLauncher.launch(arrayOf("*/*"))
         }
 
-        val btnExport = createStyledButton("Export", "#E65100") {
+        val btnExport = createScrollableButton("Export", "#E65100") {
             exportPointCloudsToPly()
         }
 
-        val btnClear = createStyledButton("Clear", "#455A64") {
+        val btnClear = createScrollableButton("Clear", "#37474F") {
             accumulatedPoints.clear()
             renderer.clearPoints()
             FileLogger.log("Cleared point cloud buffer.")
@@ -231,23 +244,32 @@ class MainActivity : AppCompatActivity() {
 
         bottomBar.addView(btnScanToggle)
         bottomBar.addView(btnOrbitToggle)
+        bottomBar.addView(btnCalibrate)
         bottomBar.addView(btnOpen)
         bottomBar.addView(btnExport)
         bottomBar.addView(btnClear)
+
+        horizontalScroll.addView(
+            bottomBar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         val bottomParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM
-            setMargins(16, 0, 16, 36)
+            setMargins(20, 0, 20, 36)
         }
-        root.addView(bottomBar, bottomParams)
+        root.addView(horizontalScroll, bottomParams)
 
         setContentView(root)
     }
 
-    private fun createStyledButton(
+    private fun createScrollableButton(
         label: String,
         hexColor: String,
         onClick: () -> Unit
@@ -256,14 +278,14 @@ class MainActivity : AppCompatActivity() {
             text = label
             isAllCaps = false
             setTextColor(Color.WHITE)
-            textSize = 11f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
                 setColor(Color.parseColor(hexColor))
                 cornerRadius = 28f
             }
-            val params = LinearLayout.LayoutParams(0, 130, 1f).apply {
-                setMargins(4, 0, 4, 0)
+            val params = LinearLayout.LayoutParams(220, 130).apply {
+                setMargins(6, 0, 6, 0)
             }
             layoutParams = params
             setOnClickListener { onClick() }
@@ -311,14 +333,12 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // Clear current view and load opened points
             accumulatedPoints.clear()
             renderer.clearPoints()
 
             accumulatedPoints.addAll(points)
             renderer.addColoredWorldPoints(points)
 
-            // Switch to 3D Orbit mode automatically so user can inspect the loaded file
             renderer.followArCamera = false
 
             FileLogger.log("Successfully loaded ${points.size} points from PLY file.")
