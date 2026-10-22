@@ -67,17 +67,8 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules
-        ethernetBinder = try {
-            EthernetNetworkBinder(poseFusionEngine)
-        } catch (_: Exception) {
-            try {
-                EthernetNetworkBinder(this)
-            } catch (_: Exception) {
-                EthernetNetworkBinder()
-            }
-        }
-
+        // Initialize helper modules with zero-argument constructors
+        ethernetBinder = EthernetNetworkBinder()
         livoxController = LivoxController()
         
         udpClient = LivoxUdpClient(poseFusionEngine) { rawPoints ->
@@ -86,8 +77,8 @@ class MainActivity : AppCompatActivity() {
                     if (p is ColoredPoint3D) {
                         p
                     } else {
-                        // Pass x, y, z, r, g, b, and reflectivity (0f)
-                        ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, 0f)
+                        // Pass integer values for colors to avoid type mismatch
+                        ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0)
                     }
                 }
                 renderer.addColoredWorldPoints(coloredList)
