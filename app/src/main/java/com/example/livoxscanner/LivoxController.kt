@@ -47,12 +47,13 @@ class LivoxController(
         controlJob?.cancel()
         controlJob = scope.launch(Dispatchers.IO) {
             try {
-                val network = ethernetBinder.ethernetNetwork.value ?: return@launch
+                val network = ethernetBinder.ethernetNetwork.value
                 val hostIp = ethernetBinder.localEthernetIp.value ?: fallbackHostIp
+                
                 val lidarAddress = if (knownLidarIp != null) {
-                    network.getByName(knownLidarIp)
+                    if (network != null) network.getByName(knownLidarIp) else InetAddress.getByName(knownLidarIp)
                 } else {
-                    discoverLidarAddress()
+                    discoverLidarAddress(network)
                 }
 
                 cmdSocket = ethernetBinder.createBoundUdpSocket(cmdPort).apply { soTimeout = 1000 }
@@ -65,6 +66,7 @@ class LivoxController(
                     putShort(imuPort.toShort())
                 }.array()
 
+                Log.i("LivoxController", "Sending handshake to LiDAR at ${lidarAddress.hostAddress} using host IP $hostIp")
                 sendPacket(buildFrame(0x00, 0x00, 0x01, handshakePayload), lidarAddress)
                 delay(150)
                 sendPacket(buildFrame(0x00, 0x00, 0x04, byteArrayOf(0x01)), lidarAddress)
@@ -81,19 +83,31 @@ class LivoxController(
         }
     }
 
-    private fun discoverLidarAddress(): InetAddress {
-        ethernetBinder.createBoundUdpSocket(55000).use { broadcastSocket ->
-            val buf = ByteArray(256)
-            val packet = DatagramPacket(buf, buf.size)
-            while (true) {
-                broadcastSocket.receive(packet)
-                if (packet.length >= 15 &&
-                    packet.data[0] == 0xAA.toByte() &&
-                    packet.data[9] == 0x00.toByte() &&
-                    packet.data[10] == 0x00.toByte()
-                ) {
-                    return packet.address
+    private fun discoverLidarAddress(network: android.net.Network?): InetAddress {
+        try {
+            ethernetBinder.createBoundUdpSocket(55000).use { broadcastSocket ->
+                broadcastSocket.broadcast = true
+                val buf = ByteArray(256)
+                val packet = DatagramPacket(buf, buf.size)
+                broadcastSocket.soTimeout = 2000
+                while (true) {
+                    broadcastSocket.receive(packet)
+                    if (packet.length >= 15 &&
+                        packet.data[0] == 0xAA.toByte() &&
+                        packet.data[9] == 0x00.toByte() &&
+                        packet.data[10] == 0x00.toByte()
+                    ) {
+                        Log.i("LivoxController", "Discovered LiDAR via broadcast at ${packet.address.hostAddress}")
+                        return packet.address
+                    }
                 }
+            }
+        } catch (e: Exception) {
+            Log.w("LivoxController", "Broadcast discovery timed out or failed (${e.message}). Falling back to default Livox IP 192.168.1.100")
+            return if (network != null) {
+                network.getByName("192.168.1.100")
+            } else {
+                InetAddress.getByName("192.168.1.100")
             }
         }
     }
