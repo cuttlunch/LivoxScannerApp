@@ -103,11 +103,11 @@ class LivoxController(
                 }
             }
         } catch (e: Exception) {
-            Log.w("LivoxController", "Broadcast discovery timed out or failed (${e.message}). Falling back to default Livox IP 192.168.1.100")
+            Log.w("LivoxController", "Broadcast discovery timed out or failed (${e.message}). Falling back to default Livox IP 192.168.1.50")
             return if (network != null) {
-                network.getByName("192.168.1.100")
+                network.getByName("192.168.1.50")
             } else {
-                InetAddress.getByName("192.168.1.100")
+                InetAddress.getByName("192.168.1.50")
             }
         }
     }
