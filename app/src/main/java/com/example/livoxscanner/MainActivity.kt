@@ -1,6 +1,7 @@
 package com.example.livoxscanner
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -33,6 +34,8 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -40,8 +43,11 @@ import java.io.OutputStreamWriter
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
+import java.util.StringTokenizer
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.cos
+import kotlin.math.sin
 
 class MainActivity : AppCompatActivity() {
 
@@ -62,6 +68,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var btnScanToggle: Button
     private lateinit var btnOrbitToggle: Button
+    private lateinit var zoomControlsLayout: LinearLayout
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var ethIp: String = "Disconnected"
@@ -69,10 +76,18 @@ class MainActivity : AppCompatActivity() {
     // Master thread-safe collection of all captured points for export/viewing
     private val accumulatedPoints = ConcurrentLinkedQueue<ColoredPoint3D>()
 
+    // Extrinsic Calibration Offsets (LiDAR -> ARCore Camera frame)
+    private var calibYawDeg = 0f
+    private var calibOffsetX = 0f
+    private var calibOffsetY = 0f
+    private var calibOffsetZ = 0f
+
+    @Volatile
+    private var lastRawSample: Point3D? = null
+
     private var prevTouchX = 0f
     private var prevTouchY = 0f
 
-    // File picker launcher for opening saved .ply files
     private val openPlyLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { loadPlyFileFromUri(it) }
     }
@@ -100,9 +115,46 @@ class MainActivity : AppCompatActivity() {
             pointDataPort = 60001,
             onPointsReceived = { pointList ->
                 try {
-                    val coloredList = pointList.map { p ->
-                        ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
+                    if (pointList.isNotEmpty()) {
+                        lastRawSample = pointList[0]
                     }
+
+                    val yawRad = Math.toRadians(calibYawDeg.toDouble()).toFloat()
+                    val cosY = cos(yawRad)
+                    val sinY = sin(yawRad)
+
+                    val coloredList = ArrayList<ColoredPoint3D>(pointList.size)
+                    for (p in pointList) {
+                        // 1. Convert Livox (+X forward, +Y left, +Z up)
+                        //    to OpenGL/ARCore Camera (-Z forward, +X right, +Y up)
+                        val camX = -p.y + calibOffsetX
+                        val camY = p.z + calibOffsetY
+                        val camZ = -p.x + calibOffsetZ
+
+                        // 2. Apply Calibration Yaw rotation
+                        val rotX = camX * cosY - camZ * sinY
+                        val rotY = camY
+                        val rotZ = camX * sinY + camZ * cosY
+
+                        // 3. Transform into ARCore World Space when tracking is active
+                        val worldPt = renderer.transformCameraToWorld(rotX, rotY, rotZ)
+
+                        // 4. Colorize by reflectivity heatmap
+                        val (r, g, b) = reflectivityToRgb(p.reflectivity)
+
+                        coloredList.add(
+                            ColoredPoint3D(
+                                worldPt[0],
+                                worldPt[1],
+                                worldPt[2],
+                                r,
+                                g,
+                                b,
+                                p.reflectivity
+                            )
+                        )
+                    }
+
                     accumulatedPoints.addAll(coloredList)
                     renderer.addColoredWorldPoints(coloredList)
                 } catch (e: Exception) {
@@ -123,15 +175,28 @@ class MainActivity : AppCompatActivity() {
         startStatusLoop()
     }
 
+    private fun reflectivityToRgb(refl: Int): Triple<Int, Int, Int> {
+        val v = refl.coerceIn(0, 255)
+        return when {
+            v < 64 -> Triple(0, v * 4, 255)
+            v < 128 -> Triple(0, 255, 255 - (v - 64) * 4)
+            v < 192 -> Triple((v - 128) * 4, 255, 0)
+            else -> Triple(255, 255 - (v - 192) * 4, 0)
+        }
+    }
+
     private fun buildProgrammaticUI() {
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
         }
 
-        // Scale detector for 3D orbit zoom mode
+        // Pinch-to-Zoom wired directly to renderer.orbitZoom
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 if (!renderer.followArCamera) {
+                    // orbitZoom is negative (e.g. -6f). Dividing by scaleFactor pulls camera closer/farther
+                    val newZoom = (renderer.orbitZoom / detector.scaleFactor).coerceIn(-100f, -0.3f)
+                    renderer.orbitZoom = newZoom
                     return true
                 }
                 return false
@@ -175,8 +240,9 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
+        // Top Status Pill
         statusText = TextView(this).apply {
-            text = "• Net: Disconnected  |  AR: WAIT  |  0.0k voxels"
+            text = "• Net: Disconnected  |  AR: WAIT  |  0.0k pts"
             setTextColor(Color.WHITE)
             textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
@@ -195,7 +261,46 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(statusText, topParams)
 
-        // Scrollable container to hold all 6 control buttons comfortably
+        // Right-side Floating Zoom Controls (+ / Reset / −) wired to renderer.orbitZoom
+        zoomControlsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(12, 16, 12, 16)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#CC1A1A24"))
+                cornerRadius = 32f
+            }
+        }
+
+        val btnZoomIn = createZoomButton("+") {
+            renderer.orbitZoom = (renderer.orbitZoom * 0.7f).coerceIn(-100f, -0.3f)
+            Toast.makeText(this, "Camera Distance: ${String.format("%.1f", -renderer.orbitZoom)}m", Toast.LENGTH_SHORT).show()
+        }
+        val btnZoomReset = createZoomButton("6m") {
+            renderer.orbitZoom = -6f
+            renderer.orbitAngleX = 20f
+            renderer.orbitAngleY = 0f
+            Toast.makeText(this, "Reset Orbit View (6m)", Toast.LENGTH_SHORT).show()
+        }
+        val btnZoomOut = createZoomButton("−") {
+            renderer.orbitZoom = (renderer.orbitZoom * 1.4f).coerceIn(-100f, -0.3f)
+            Toast.makeText(this, "Camera Distance: ${String.format("%.1f", -renderer.orbitZoom)}m", Toast.LENGTH_SHORT).show()
+        }
+
+        zoomControlsLayout.addView(btnZoomIn)
+        zoomControlsLayout.addView(btnZoomReset)
+        zoomControlsLayout.addView(btnZoomOut)
+
+        val zoomParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            rightMargin = 28
+        }
+        root.addView(zoomControlsLayout, zoomParams)
+
+        // Bottom Scrollable Control Bar
         val horizontalScroll = HorizontalScrollView(this).apply {
             isFillViewport = true
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -221,21 +326,24 @@ class MainActivity : AppCompatActivity() {
             if (renderer.followArCamera) {
                 try {
                     arSession?.resume()
+                    btnOrbitToggle.text = "3D Orbit"
+                    updateButtonColor(btnOrbitToggle, "#1565C0")
                     FileLogger.log("Camera mode switched to: AR View (Camera Resumed)")
-                    Toast.makeText(this, "Mode: AR View", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Mode: AR Live View", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
                     FileLogger.log("Failed to resume AR session: ${e.message}")
                 }
             } else {
                 arSession?.pause()
+                btnOrbitToggle.text = "AR View"
+                updateButtonColor(btnOrbitToggle, "#00897B")
                 FileLogger.log("Camera mode switched to: 3D Orbit (Camera Paused)")
                 Toast.makeText(this, "Mode: 3D Orbit (Camera Off)", Toast.LENGTH_SHORT).show()
             }
         }
 
         val btnCalibrate = createScrollableButton("Calibrate", "#455A64") {
-            FileLogger.log("User pressed Calibrate.")
-            Toast.makeText(this, "Calibrating extrinsic pose...", Toast.LENGTH_SHORT).show()
+            runCalibrationWithFeedback()
         }
 
         val btnOpen = createScrollableButton("Open", "#673AB7") {
@@ -278,6 +386,67 @@ class MainActivity : AppCompatActivity() {
         root.addView(horizontalScroll, bottomParams)
 
         setContentView(root)
+    }
+
+    private fun runCalibrationWithFeedback() {
+        FileLogger.log("User pressed Calibrate.")
+        val sample = lastRawSample
+        val arTracking = poseFusionEngine.isTracking
+        val pointTotal = renderer.pointCount
+
+        val sampleInfo = if (sample != null) {
+            "Latest Raw LiDAR Point:\n" +
+            "  • Forward (X): ${String.format("%.2f", sample.x)} m\n" +
+            "  • Left (Y): ${String.format("%.2f", sample.y)} m\n" +
+            "  • Up (Z): ${String.format("%.2f", sample.z)} m\n" +
+            "  • Reflectivity: ${sample.reflectivity}"
+        } else {
+            "Latest Raw LiDAR Point: None received yet (Tap Scan first)"
+        }
+
+        val statusReport = StringBuilder().apply {
+            append("✅ Axis Transform: Livox (+X Fwd) ➔ OpenGL (-Z Fwd)\n")
+            append("• Current Yaw Offset: ${calibYawDeg.toInt()}°\n")
+            append("• ARCore Tracking: ${if (arTracking) "ACTIVE (World Locked)" else "WAIT (Showing Live Camera-Space Overlay)"}\n")
+            append("• Rendered Points: $pointTotal\n\n")
+            append(sampleInfo)
+        }.toString()
+
+        AlertDialog.Builder(this)
+            .setTitle("Calibration & Live Overlay")
+            .setMessage(statusReport)
+            .setPositiveButton("Rotate +90°") { _, _ ->
+                calibYawDeg = (calibYawDeg + 90f) % 360f
+                Toast.makeText(this, "LiDAR Yaw rotated to ${calibYawDeg.toInt()}°", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("Reset 0°") { _, _ ->
+                calibYawDeg = 0f
+                renderer.orbitZoom = -6f
+                renderer.orbitAngleX = 20f
+                renderer.orbitAngleY = 0f
+                Toast.makeText(this, "Calibration Reset to 0°", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun createZoomButton(label: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#37474F"))
+                cornerRadius = 24f
+            }
+            val params = LinearLayout.LayoutParams(125, 120).apply {
+                setMargins(0, 8, 0, 8)
+            }
+            layoutParams = params
+            setOnClickListener { onClick() }
+        }
     }
 
     private fun createScrollableButton(
@@ -335,65 +504,117 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadPlyFileFromUri(uri: Uri) {
-        try {
-            val inputStream = contentResolver.openInputStream(uri) ?: return
-            val points = parseAsciiPly(inputStream)
+        Toast.makeText(this, "Loading PLY file...", Toast.LENGTH_SHORT).show()
+        val startTime = System.currentTimeMillis()
 
-            if (points.isEmpty()) {
-                Toast.makeText(this, "No points found or invalid PLY file", Toast.LENGTH_SHORT).show()
-                return
+        activityScope.launch(Dispatchers.IO) {
+            try {
+                val inputStream = contentResolver.openInputStream(uri)
+                if (inputStream == null) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Could not open file stream", Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
+
+                val points = inputStream.use { parseAsciiPlyFast(it) }
+                val elapsedMs = System.currentTimeMillis() - startTime
+
+                withContext(Dispatchers.Main) {
+                    if (points.isEmpty()) {
+                        Toast.makeText(this@MainActivity, "No points found in PLY file", Toast.LENGTH_SHORT).show()
+                        return@withContext
+                    }
+
+                    accumulatedPoints.clear()
+                    renderer.clearPoints()
+
+                    accumulatedPoints.addAll(points)
+                    renderer.addColoredWorldPoints(points)
+
+                    arSession?.pause()
+                    renderer.followArCamera = false
+                    renderer.orbitZoom = -6f
+                    btnOrbitToggle.text = "AR View"
+                    updateButtonColor(btnOrbitToggle, "#00897B")
+
+                    FileLogger.log("Loaded ${points.size} points in ${elapsedMs}ms (Camera Paused).")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Loaded ${points.size} pts in ${elapsedMs}ms",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } catch (e: Exception) {
+                FileLogger.log("Failed to load PLY file: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Error loading file: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
-
-            accumulatedPoints.clear()
-            renderer.clearPoints()
-
-            accumulatedPoints.addAll(points)
-            renderer.addColoredWorldPoints(points)
-
-            arSession?.pause()
-            renderer.followArCamera = false
-
-            FileLogger.log("Successfully loaded ${points.size} points from PLY file (Camera Paused).")
-            Toast.makeText(this, "Loaded ${points.size} points (Camera Off)", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            FileLogger.log("Failed to load PLY file: ${e.message}")
-            Toast.makeText(this, "Error loading file: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun parseAsciiPly(inputStream: InputStream): List<ColoredPoint3D> {
-        val points = mutableListOf<ColoredPoint3D>()
-        val reader = BufferedReader(InputStreamReader(inputStream))
+    private fun parseAsciiPlyFast(inputStream: InputStream): List<ColoredPoint3D> {
+        val reader = BufferedReader(InputStreamReader(inputStream), 65536)
         var line: String?
         var vertexCount = 0
-        var isHeader = true
 
         while (reader.readLine().also { line = it } != null) {
-            val trimmed = line!!.trim()
-            if (trimmed.startsWith("element vertex")) {
-                vertexCount = trimmed.split("\\s+".toRegex()).last().toIntOrNull() ?: 0
-            }
-            if (trimmed == "end_header") {
-                isHeader = false
+            val l = line!!.trim()
+            if (l.startsWith("element vertex")) {
+                val idx = l.lastIndexOf(' ')
+                if (idx != -1) {
+                    vertexCount = l.substring(idx + 1).toIntOrNull() ?: 0
+                }
+            } else if (l == "end_header") {
                 break
             }
         }
 
+        val points = ArrayList<ColoredPoint3D>(if (vertexCount > 0) vertexCount else 50000)
         var readCount = 0
-        while (readCount < vertexCount && reader.readLine().also { line = it } != null) {
-            val parts = line!!.trim().split("\\s+".toRegex())
-            if (parts.size >= 3) {
-                val x = parts[0].toFloatOrNull() ?: 0f
-                val y = parts[1].toFloatOrNull() ?: 0f
-                val z = parts[2].toFloatOrNull() ?: 0f
-                val r = if (parts.size >= 6) parts[3].toIntOrNull() ?: 0 else 0
-                val g = if (parts.size >= 6) parts[4].toIntOrNull() ?: 255 else 255
-                val b = if (parts.size >= 6) parts[5].toIntOrNull() ?: 0 else 0
+        val maxToRead = if (vertexCount > 0) vertexCount else Int.MAX_VALUE
 
+        // Auto-center bounding box calculation so old saved PLY scans appear centered in Orbit View
+        var sumX = 0.0
+        var sumY = 0.0
+        var sumZ = 0.0
+
+        while (readCount < maxToRead && reader.readLine().also { line = it } != null) {
+            val l = line!!
+            if (l.isBlank()) continue
+            val tokenizer = StringTokenizer(l)
+            if (tokenizer.countTokens() >= 3) {
+                val x = tokenizer.nextToken().toFloatOrNull() ?: 0f
+                val y = tokenizer.nextToken().toFloatOrNull() ?: 0f
+                val z = tokenizer.nextToken().toFloatOrNull() ?: 0f
+                var r = 0
+                var g = 255
+                var b = 0
+                if (tokenizer.countTokens() >= 3) {
+                    r = tokenizer.nextToken().toIntOrNull() ?: 0
+                    g = tokenizer.nextToken().toIntOrNull() ?: 255
+                    b = tokenizer.nextToken().toIntOrNull() ?: 0
+                }
+                sumX += x
+                sumY += y
+                sumZ += z
                 points.add(ColoredPoint3D(x, y, z, r, g, b, 255))
                 readCount++
             }
         }
+
+        // Center the loaded cloud at (0, 0, 0) so rotating & zooming in 3D Orbit pivots around the model's center
+        if (points.isNotEmpty()) {
+            val cx = (sumX / points.size).toFloat()
+            val cy = (sumY / points.size).toFloat()
+            val cz = (sumZ / points.size).toFloat()
+            for (i in points.indices) {
+                val p = points[i]
+                points[i] = p.copy(x = p.x - cx, y = p.y - cy, z = p.z - cz)
+            }
+        }
+
         return points
     }
 
@@ -403,45 +624,60 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        try {
-            val fileName = "LivoxScan_${System.currentTimeMillis()}.ply"
-            val resolver = contentResolver
-            val contentValues = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOCUMENTS}/LivoxScans")
-            }
+        Toast.makeText(this, "Exporting ${accumulatedPoints.size} points...", Toast.LENGTH_SHORT).show()
 
-            val uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
-            if (uri == null) {
-                Toast.makeText(this, "Failed to create file in Documents", Toast.LENGTH_SHORT).show()
-                return
-            }
+        activityScope.launch(Dispatchers.IO) {
+            try {
+                val snapshot = accumulatedPoints.toList()
+                val fileName = "LivoxScan_${System.currentTimeMillis()}.ply"
+                val resolver = contentResolver
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOCUMENTS}/LivoxScans")
+                }
 
-            resolver.openOutputStream(uri)?.use { outputStream ->
-                OutputStreamWriter(outputStream).use { writer ->
-                    writer.write("ply\n")
-                    writer.write("format ascii 1.0\n")
-                    writer.write("element vertex ${accumulatedPoints.size}\n")
-                    writer.write("property float x\n")
-                    writer.write("property float y\n")
-                    writer.write("property float z\n")
-                    writer.write("property uchar red\n")
-                    writer.write("property uchar green\n")
-                    writer.write("property uchar blue\n")
-                    writer.write("end_header\n") // Fixed typo here
+                val uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+                if (uri == null) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Failed to create file in Documents", Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
 
-                    for (p in accumulatedPoints) {
-                        writer.write("${p.x} ${p.y} ${p.z} ${p.r} ${p.g} ${p.b}\n")
+                resolver.openOutputStream(uri)?.use { outputStream ->
+                    OutputStreamWriter(outputStream).buffered(65536).use { writer ->
+                        writer.write("ply\n")
+                        writer.write("format ascii 1.0\n")
+                        writer.write("element vertex ${snapshot.size}\n")
+                        writer.write("property float x\n")
+                        writer.write("property float y\n")
+                        writer.write("property float z\n")
+                        writer.write("property uchar red\n")
+                        writer.write("property uchar green\n")
+                        writer.write("property uchar blue\n")
+                        writer.write("end_header\n")
+
+                        for (p in snapshot) {
+                            writer.write("${p.x} ${p.y} ${p.z} ${p.r} ${p.g} ${p.b}\n")
+                        }
                     }
                 }
-            }
 
-            FileLogger.log("Successfully exported ${accumulatedPoints.size} points to Documents/LivoxScans/$fileName")
-            Toast.makeText(this, "Saved to Documents/LivoxScans/$fileName", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            FileLogger.log("Export failed: ${e.message}")
-            Toast.makeText(this, "Export error: ${e.message}", Toast.LENGTH_LONG).show()
+                FileLogger.log("Successfully exported ${snapshot.size} points to Documents/LivoxScans/$fileName")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Saved (${snapshot.size} pts): Documents/LivoxScans/$fileName",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } catch (e: Exception) {
+                FileLogger.log("Export failed: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Export error: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -451,9 +687,15 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 renderer.displayRotation = windowManager.defaultDisplay.rotation
                 checkNetworkInterfaces()
-                val arState = if (poseFusionEngine.isTracking) "TRACKING" else "WAIT"
+                val arState = if (!renderer.followArCamera) {
+                    "ORBIT"
+                } else if (poseFusionEngine.isTracking) {
+                    "TRACKING"
+                } else {
+                    "WAIT"
+                }
                 val kVoxels = String.format("%.1fk", renderer.pointCount / 1000f)
-                statusText.text = "• Net: $ethIp  |  AR: $arState  |  $kVoxels voxels"
+                statusText.text = "• Net: $ethIp  |  AR: $arState  |  $kVoxels pts"
                 uiHandler.postDelayed(this, 500)
             }
         }
