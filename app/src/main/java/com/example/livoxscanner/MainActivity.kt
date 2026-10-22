@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Environment
@@ -14,11 +15,13 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -28,6 +31,9 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.io.BufferedReader
+import java.io.InputStream
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -58,11 +64,16 @@ class MainActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var ethIp: String = "Disconnected"
 
-    // Master thread-safe collection of all captured points for export
+    // Master thread-safe collection of all captured points for export/viewing
     private val accumulatedPoints = ConcurrentLinkedQueue<ColoredPoint3D>()
 
     private var prevTouchX = 0f
     private var prevTouchY = 0f
+
+    // File picker launcher for opening saved .ply files
+    private val openPlyLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { loadPlyFileFromUri(it) }
+    }
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 100
@@ -90,7 +101,6 @@ class MainActivity : AppCompatActivity() {
                     val coloredList = pointList.map { p ->
                         ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
                     }
-                    // Accumulate points for export
                     accumulatedPoints.addAll(coloredList)
                     renderer.addColoredWorldPoints(coloredList)
                 } catch (e: Exception) {
@@ -116,9 +126,19 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                if (!renderer.followArCamera) {
+                    return true
+                }
+                return false
+            }
+        })
+
         glSurfaceView = object : GLSurfaceView(this) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
-                if (!renderer.followArCamera) {
+                scaleDetector.onTouchEvent(event)
+                if (!renderer.followArCamera && !scaleDetector.isInProgress) {
                     when (event.action) {
                         MotionEvent.ACTION_DOWN -> {
                             prevTouchX = event.x
@@ -175,14 +195,14 @@ class MainActivity : AppCompatActivity() {
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(16, 32, 16, 32)
+            setPadding(8, 32, 8, 32)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#D912121A"))
                 cornerRadius = 36f
             }
         }
 
-        btnScanToggle = createStyledButton("Start Scan", "#2E7D32") {
+        btnScanToggle = createStyledButton("Scan", "#2E7D32") {
             toggleScan()
         }
 
@@ -191,6 +211,11 @@ class MainActivity : AppCompatActivity() {
             val mode = if (renderer.followArCamera) "AR View" else "3D Orbit"
             FileLogger.log("Camera mode switched to: $mode")
             Toast.makeText(this, "Mode: $mode", Toast.LENGTH_SHORT).show()
+        }
+
+        val btnOpen = createStyledButton("Open", "#673AB7") {
+            // Launch file picker to select .ply files
+            openPlyLauncher.launch(arrayOf("*/*"))
         }
 
         val btnExport = createStyledButton("Export", "#E65100") {
@@ -206,6 +231,7 @@ class MainActivity : AppCompatActivity() {
 
         bottomBar.addView(btnScanToggle)
         bottomBar.addView(btnOrbitToggle)
+        bottomBar.addView(btnOpen)
         bottomBar.addView(btnExport)
         bottomBar.addView(btnClear)
 
@@ -214,7 +240,7 @@ class MainActivity : AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM
-            setMargins(24, 0, 24, 36)
+            setMargins(16, 0, 16, 36)
         }
         root.addView(bottomBar, bottomParams)
 
@@ -230,14 +256,14 @@ class MainActivity : AppCompatActivity() {
             text = label
             isAllCaps = false
             setTextColor(Color.WHITE)
-            textSize = 12f
+            textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
                 setColor(Color.parseColor(hexColor))
                 cornerRadius = 28f
             }
             val params = LinearLayout.LayoutParams(0, 130, 1f).apply {
-                setMargins(6, 0, 6, 0)
+                setMargins(4, 0, 4, 0)
             }
             layoutParams = params
             setOnClickListener { onClick() }
@@ -256,7 +282,7 @@ class MainActivity : AppCompatActivity() {
         isScanning.set(nowScanning)
 
         if (nowScanning) {
-            btnScanToggle.text = "Stop Scan"
+            btnScanToggle.text = "Stop"
             updateButtonColor(btnScanToggle, "#C62828")
             FileLogger.log("SCAN STARTED.")
 
@@ -265,7 +291,7 @@ class MainActivity : AppCompatActivity() {
 
             Toast.makeText(this, "Livox scanning started", Toast.LENGTH_SHORT).show()
         } else {
-            btnScanToggle.text = "Start Scan"
+            btnScanToggle.text = "Scan"
             updateButtonColor(btnScanToggle, "#2E7D32")
             FileLogger.log("SCAN STOPPED. Total Voxels=${renderer.pointCount}")
 
@@ -273,6 +299,70 @@ class MainActivity : AppCompatActivity() {
 
             Toast.makeText(this, "Livox scanning stopped", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun loadPlyFileFromUri(uri: Uri) {
+        try {
+            val inputStream = contentResolver.openInputStream(uri) ?: return
+            val points = parseAsciiPly(inputStream)
+
+            if (points.isEmpty()) {
+                Toast.makeText(this, "No points found or invalid PLY file", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // Clear current view and load opened points
+            accumulatedPoints.clear()
+            renderer.clearPoints()
+
+            accumulatedPoints.addAll(points)
+            renderer.addColoredWorldPoints(points)
+
+            // Switch to 3D Orbit mode automatically so user can inspect the loaded file
+            renderer.followArCamera = false
+
+            FileLogger.log("Successfully loaded ${points.size} points from PLY file.")
+            Toast.makeText(this, "Loaded ${points.size} points (3D Orbit Mode)", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            FileLogger.log("Failed to load PLY file: ${e.message}")
+            Toast.makeText(this, "Error loading file: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun parseAsciiPly(inputStream: InputStream): List<ColoredPoint3D> {
+        val points = mutableListOf<ColoredPoint3D>()
+        val reader = BufferedReader(InputStreamReader(inputStream))
+        var line: String?
+        var vertexCount = 0
+        var isHeader = true
+
+        while (reader.readLine().also { line = it } != null) {
+            val trimmed = line!!.trim()
+            if (trimmed.startsWith("element vertex")) {
+                vertexCount = trimmed.split("\\s+".toRegex()).last().toIntOrNull() ?: 0
+            }
+            if (trimmed == "end_header") {
+                isHeader = false
+                break
+            }
+        }
+
+        var readCount = 0
+        while (readCount < vertexCount && reader.readLine().also { line = it } != null) {
+            val parts = line!!.trim().split("\\s+".toRegex())
+            if (parts.size >= 3) {
+                val x = parts[0].toFloatOrNull() ?: 0f
+                val y = parts[1].toFloatOrNull() ?: 0f
+                val z = parts[2].toFloatOrNull() ?: 0f
+                val r = if (parts.size >= 6) parts[3].toIntOrNull() ?: 0 else 0
+                val g = if (parts.size >= 6) parts[4].toIntOrNull() ?: 255 else 255
+                val b = if (parts.size >= 6) parts[5].toIntOrNull() ?: 0 else 0
+
+                points.add(ColoredPoint3D(x, y, z, r, g, b, 255))
+                readCount++
+            }
+        }
+        return points
     }
 
     private fun exportPointCloudsToPly() {
