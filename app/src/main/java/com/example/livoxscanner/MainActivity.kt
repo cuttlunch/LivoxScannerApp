@@ -174,26 +174,29 @@ class MainActivity : AppCompatActivity() {
             background = roundedBg(Color.parseColor("#CC12141C"), 32f)
         }
 
-        val btnScan = styledButton("Start Scan", Color.parseColor("#00C853")).apply {
-            setOnClickListener {
-                if (!isScanning) {
-                    if (ethernetBinder.ethernetNetwork.value == null) {
-                        Toast.makeText(context, "Plug in USB-C Ethernet adapter first!", Toast.LENGTH_SHORT).show()
-                        return@setOnClickListener
-                    }
-                    isScanning = true
-                    text = "Stop Scan"
-                    background = roundedBg(Color.parseColor("#D50000"), 24f)
-                    livoxClient.startListening(lifecycleScope)
-                    livoxController.connectAndStartLaser(lifecycleScope)
-                } else {
-                    isScanning = false
-                    text = "Start Scan"
-                    background = roundedBg(Color.parseColor("#00C853"), 24f)
-                    livoxClient.stopListening()
-                }
+     val btnScan = styledButton("Start Scan", Color.parseColor("#00C853")).apply {
+    setOnClickListener {
+        if (!isScanning) {
+            isScanning = true
+            text = "Stop Scan"
+            background = roundedBg(Color.parseColor("#D50000"), 24f)
+            
+            // Force assign static IP fallback if OS hasn't initialized eth0 yet
+            if (ethernetBinder.localEthernetIp.value == null) {
+                Toast.init
             }
+            
+            livoxClient.startListening(lifecycleScope)
+            livoxController.connectAndStartLaser(lifecycleScope)
+            Toast.makeText(context, "Initiating Livox Mid-40 stream...", Toast.LENGTH_SHORT).show()
+        } else {
+            isScanning = false
+            text = "Start Scan"
+            background = roundedBg(Color.parseColor("#00C853"), 24f)
+            livoxClient.stopListening()
         }
+    }
+}
 
         val btnOrbit = styledButton("3D Orbit", Color.parseColor("#2962FF")).apply {
             setOnClickListener {
