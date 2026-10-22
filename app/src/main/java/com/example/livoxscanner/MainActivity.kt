@@ -22,6 +22,9 @@ import androidx.core.content.ContextCompat
 import com.google.ar.core.Config
 import com.google.ar.core.Session
 import com.google.ar.core.exceptions.CameraNotAvailableException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import java.net.NetworkInterface
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
@@ -36,6 +39,7 @@ class MainActivity : AppCompatActivity() {
 
     private var arSession: Session? = null
     private val isScanning = AtomicBoolean(false)
+    private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     // Project components
     private lateinit var ethernetBinder: EthernetNetworkBinder
@@ -67,19 +71,14 @@ class MainActivity : AppCompatActivity() {
         poseFusionEngine = PoseFusionEngine(colorizer, voxelFilter)
         renderer = ArPointCloudRenderer(poseFusionEngine, colorizer)
 
-        // Initialize helper modules with zero-argument constructors
-        ethernetBinder = EthernetNetworkBinder()
+        // Initialize helper modules using exact constructor signatures
+        ethernetBinder = EthernetNetworkBinder(this)
         livoxController = LivoxController()
         
-        udpClient = LivoxUdpClient(poseFusionEngine) { rawPoints ->
+        udpClient = LivoxUdpClient(ethernetBinder, 60001) { pointList ->
             try {
-                val coloredList = rawPoints.map { p ->
-                    if (p is ColoredPoint3D) {
-                        p
-                    } else {
-                        // Pass integer values for colors to avoid type mismatch
-                        ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0)
-                    }
+                val coloredList = pointList.map { p ->
+                    ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
                 }
                 renderer.addColoredWorldPoints(coloredList)
             } catch (e: Exception) {
@@ -248,11 +247,8 @@ class MainActivity : AppCompatActivity() {
             updateButtonColor(btnScanToggle, "#C62828")
             FileLogger.log("SCAN STARTED.")
             
-            try {
-                val m = udpClient.javaClass.methods.find { it.name.lowercase().contains("start") }
-                m?.invoke(udpClient)
-            } catch (_: Exception) {}
-
+            udpClient.startListening(activityScope)
+            
             try {
                 val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("start") }
                 m?.invoke(livoxController)
@@ -264,11 +260,8 @@ class MainActivity : AppCompatActivity() {
             updateButtonColor(btnScanToggle, "#2E7D32")
             FileLogger.log("SCAN STOPPED. Total Voxels=${renderer.pointCount}")
             
-            try {
-                val m = udpClient.javaClass.methods.find { it.name.lowercase().contains("stop") }
-                m?.invoke(udpClient)
-            } catch (_: Exception) {}
-
+            udpClient.stopListening()
+            
             try {
                 val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("stop") }
                 m?.invoke(livoxController)
