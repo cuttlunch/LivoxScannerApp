@@ -1,14 +1,17 @@
 package com.example.livoxscanner
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
 import android.widget.Button
@@ -25,9 +28,11 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.io.OutputStreamWriter
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
@@ -52,6 +57,9 @@ class MainActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var ethIp: String = "Disconnected"
+
+    // Master thread-safe collection of all captured points for export
+    private val accumulatedPoints = ConcurrentLinkedQueue<ColoredPoint3D>()
 
     private var prevTouchX = 0f
     private var prevTouchY = 0f
@@ -82,6 +90,8 @@ class MainActivity : AppCompatActivity() {
                     val coloredList = pointList.map { p ->
                         ColoredPoint3D(p.x, p.y, p.z, 0, 255, 0, p.reflectivity)
                     }
+                    // Accumulate points for export
+                    accumulatedPoints.addAll(coloredList)
                     renderer.addColoredWorldPoints(coloredList)
                 } catch (e: Exception) {
                     FileLogger.log("Point mapping error: ${e.message}")
@@ -165,7 +175,7 @@ class MainActivity : AppCompatActivity() {
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(24, 32, 24, 32)
+            setPadding(16, 32, 16, 32)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#D912121A"))
                 cornerRadius = 36f
@@ -183,12 +193,12 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Mode: $mode", Toast.LENGTH_SHORT).show()
         }
 
-        val btnCalibrate = createStyledButton("Calibrate", "#455A64") {
-            FileLogger.log("User pressed Calibrate.")
-            Toast.makeText(this, "Calibrating extrinsic pose...", Toast.LENGTH_SHORT).show()
+        val btnExport = createStyledButton("Export", "#E65100") {
+            exportPointCloudsToPly()
         }
 
         val btnClear = createStyledButton("Clear", "#455A64") {
+            accumulatedPoints.clear()
             renderer.clearPoints()
             FileLogger.log("Cleared point cloud buffer.")
             Toast.makeText(this, "Cleared points", Toast.LENGTH_SHORT).show()
@@ -196,7 +206,7 @@ class MainActivity : AppCompatActivity() {
 
         bottomBar.addView(btnScanToggle)
         bottomBar.addView(btnOrbitToggle)
-        bottomBar.addView(btnCalibrate)
+        bottomBar.addView(btnExport)
         bottomBar.addView(btnClear)
 
         val bottomParams = FrameLayout.LayoutParams(
@@ -220,14 +230,14 @@ class MainActivity : AppCompatActivity() {
             text = label
             isAllCaps = false
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
                 setColor(Color.parseColor(hexColor))
                 cornerRadius = 28f
             }
             val params = LinearLayout.LayoutParams(0, 130, 1f).apply {
-                setMargins(10, 0, 10, 0)
+                setMargins(6, 0, 6, 0)
             }
             layoutParams = params
             setOnClickListener { onClick() }
@@ -262,6 +272,54 @@ class MainActivity : AppCompatActivity() {
             udpClient.stopListening()
 
             Toast.makeText(this, "Livox scanning stopped", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun exportPointCloudsToPly() {
+        if (accumulatedPoints.isEmpty()) {
+            Toast.makeText(this, "No points captured to export!", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        try {
+            val fileName = "LivoxScan_${System.currentTimeMillis()}.ply"
+            val resolver = contentResolver
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOCUMENTS}/LivoxScans")
+            }
+
+            val uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+            if (uri == null) {
+                Toast.makeText(this, "Failed to create file in Documents", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            resolver.openOutputStream(uri)?.use { outputStream ->
+                OutputStreamWriter(outputStream).use { writer ->
+                    writer.write("ply\n")
+                    writer.write("format ascii 1.0\n")
+                    writer.write("element vertex ${accumulatedPoints.size}\n")
+                    writer.write("property float x\n")
+                    writer.write("property float y\n")
+                    writer.write("property float z\n")
+                    writer.write("property uchar red\n")
+                    writer.write("property uchar green\n")
+                    writer.write("property uchar blue\n")
+                    writer.write("end_header\n")
+
+                    for (p in accumulatedPoints) {
+                        writer.write("${p.x} ${p.y} ${p.z} ${p.r} ${p.g} ${p.b}\n")
+                    }
+                }
+            }
+
+            FileLogger.log("Successfully exported ${accumulatedPoints.size} points to Documents/LivoxScans/$fileName")
+            Toast.makeText(this, "Saved to Documents/LivoxScans/$fileName", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            FileLogger.log("Export failed: ${e.message}")
+            Toast.makeText(this, "Export error: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
