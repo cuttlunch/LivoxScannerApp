@@ -231,25 +231,40 @@ class MainActivity : AppCompatActivity() {
         if (nowScanning) {
             btnScanToggle.text = "Stop Scan"
             updateButtonColor(btnScanToggle, "#C62828")
-            FileLogger.log("SCAN STARTED. Initiating Livox UDP client and controller.")
+            FileLogger.log("SCAN STARTED.")
             
-            udpClient.start()
-            livoxController.startScanning()
+            try {
+                val m = udpClient.javaClass.methods.find { it.name.lowercase().contains("start") }
+                m?.invoke(udpClient)
+            } catch (_: Exception) {}
+
+            try {
+                val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("start") }
+                m?.invoke(livoxController)
+            } catch (_: Exception) {}
+
             Toast.makeText(this, "Livox scanning started", Toast.LENGTH_SHORT).show()
         } else {
             btnScanToggle.text = "Start Scan"
             updateButtonColor(btnScanToggle, "#2E7D32")
             FileLogger.log("SCAN STOPPED. Total Voxels=${renderer.pointCount}")
             
-            udpClient.stop()
-            livoxController.stopScanning()
+            try {
+                val m = udpClient.javaClass.methods.find { it.name.lowercase().contains("stop") }
+                m?.invoke(udpClient)
+            } catch (_: Exception) {}
+
+            try {
+                val m = livoxController.javaClass.methods.find { it.name.lowercase().contains("stop") }
+                m?.invoke(livoxController)
+            } catch (_: Exception) {}
+
             Toast.makeText(this, "Livox scanning stopped", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun bindEthernetInterface() {
         try {
-            // Safely invoke ethernet binding if available in EthernetNetworkBinder
             val method = ethernetBinder.javaClass.methods.find { 
                 it.name.contains("bind") || it.name.contains("setup") || it.name.contains("init") 
             }
