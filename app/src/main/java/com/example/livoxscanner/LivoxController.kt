@@ -20,6 +20,9 @@ class LivoxController(
     private var controlJob: Job? = null
     private var cmdSocket: DatagramSocket? = null
 
+    // CHANGE THIS TO MATCH WHATEVER STATIC IP YOU GAVE THE SCANNER (e.g., 192.168.1.50 or 192.168.1.80)
+    private val targetLidarIp = "192.168.1.50"
+
     private fun buildFrame(
         packetType: Byte = 0x00,
         cmdSet: Byte,
@@ -66,7 +69,7 @@ class LivoxController(
                     putShort(imuPort.toShort())
                 }.array()
 
-                Log.i("LivoxController", "Sending handshake to LiDAR at ${lidarAddress.hostAddress} using host IP $hostIp")
+                FileLogger.log("Connecting to LiDAR at ${lidarAddress.hostAddress} using host IP $hostIp")
                 sendPacket(buildFrame(0x00, 0x00, 0x01, handshakePayload), lidarAddress)
                 delay(150)
                 sendPacket(buildFrame(0x00, 0x00, 0x04, byteArrayOf(0x01)), lidarAddress)
@@ -76,7 +79,7 @@ class LivoxController(
                     sendPacket(buildFrame(0x00, 0x00, 0x03), lidarAddress)
                 }
             } catch (e: Exception) {
-                Log.e("LivoxController", "Control error: ${e.message}", e)
+                FileLogger.log("Livox Control error: ${e.message}")
             } finally {
                 cmdSocket?.close()
             }
@@ -89,7 +92,7 @@ class LivoxController(
                 broadcastSocket.broadcast = true
                 val buf = ByteArray(256)
                 val packet = DatagramPacket(buf, buf.size)
-                broadcastSocket.soTimeout = 2000
+                broadcastSocket.soTimeout = 1500
                 while (true) {
                     broadcastSocket.receive(packet)
                     if (packet.length >= 15 &&
@@ -97,17 +100,17 @@ class LivoxController(
                         packet.data[9] == 0x00.toByte() &&
                         packet.data[10] == 0x00.toByte()
                     ) {
-                        Log.i("LivoxController", "Discovered LiDAR via broadcast at ${packet.address.hostAddress}")
+                        FileLogger.log("Discovered LiDAR via broadcast at ${packet.address.hostAddress}")
                         return packet.address
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.w("LivoxController", "Broadcast discovery timed out or failed (${e.message}). Falling back to default Livox IP 192.168.1.50")
+            FileLogger.log("Broadcast discovery timed out. Using target IP: $targetLidarIp")
             return if (network != null) {
-                network.getByName("192.168.1.50")
+                network.getByName(targetLidarIp)
             } else {
-                InetAddress.getByName("192.168.1.50")
+                InetAddress.getByName(targetLidarIp)
             }
         }
     }
