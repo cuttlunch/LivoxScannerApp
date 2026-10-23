@@ -5,6 +5,23 @@ import com.google.ar.core.Pose
 import java.util.concurrent.ConcurrentSkipListMap
 import kotlin.math.abs
 
+data class Point3D(
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val reflectivity: Int
+)
+
+data class ColoredPoint3D(
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val r: Int,
+    val g: Int,
+    val b: Int,
+    val reflectivity: Int
+)
+
 class PoseFusionEngine(
     private val colorizer: CameraColorizer,
     private val voxelFilter: VoxelGridFilter,
