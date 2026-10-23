@@ -46,8 +46,10 @@ import java.util.Collections
 import java.util.StringTokenizer
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
@@ -73,13 +75,11 @@ class MainActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var ethIp: String = "Disconnected"
 
-    // Master thread-safe collection of all captured points for export/viewing
     private val accumulatedPoints = ConcurrentLinkedQueue<ColoredPoint3D>()
 
-    // Extrinsic Calibration Offsets (LiDAR -> ARCore Camera frame)
     private var calibYawDeg = 0f
     private var calibOffsetX = 0f
-    private var calibOffsetY = 0f
+    private var calibOffsetY = -0.08f // Default 8cm vertical offset (Phone mounted above Livox)
     private var calibOffsetZ = 0f
 
     @Volatile
@@ -115,32 +115,40 @@ class MainActivity : AppCompatActivity() {
             pointDataPort = 60001,
             onPointsReceived = { pointList ->
                 try {
-                    if (pointList.isNotEmpty()) {
-                        lastRawSample = pointList[0]
-                    }
-
                     val yawRad = Math.toRadians(calibYawDeg.toDouble()).toFloat()
                     val cosY = cos(yawRad)
                     val sinY = sin(yawRad)
 
                     val coloredList = ArrayList<ColoredPoint3D>(pointList.size)
                     for (p in pointList) {
+                        // Auto-guard: if LivoxUdpClient ever passes raw mm (> 80f), convert to meters
+                        val sx = if (abs(p.x) > 80f || abs(p.y) > 80f || abs(p.z) > 80f) p.x / 1000f else p.x
+                        val sy = if (abs(p.x) > 80f || abs(p.y) > 80f || abs(p.z) > 80f) p.y / 1000f else p.y
+                        val sz = if (abs(p.x) > 80f || abs(p.y) > 80f || abs(p.z) > 80f) p.z / 1000f else p.z
+
+                        // Reject dead origin returns (< 10cm from sensor)
+                        val distSq = sx * sx + sy * sy + sz * sz
+                        if (distSq < 0.01f) continue
+
+                        lastRawSample = Point3D(sx, sy, sz, p.reflectivity)
+
                         // 1. Convert Livox (+X forward, +Y left, +Z up)
                         //    to OpenGL/ARCore Camera (-Z forward, +X right, +Y up)
-                        val camX = -p.y + calibOffsetX
-                        val camY = p.z + calibOffsetY
-                        val camZ = -p.x + calibOffsetZ
+                        val camX = -sy + calibOffsetX
+                        val camY = sz + calibOffsetY
+                        val camZ = -sx + calibOffsetZ
 
                         // 2. Apply Calibration Yaw rotation
                         val rotX = camX * cosY - camZ * sinY
                         val rotY = camY
                         val rotZ = camX * sinY + camZ * cosY
 
-                        // 3. Transform into ARCore World Space when tracking is active
-                        val worldPt = renderer.transformCameraToWorld(rotX, rotY, rotZ)
+                        // 3. Sample live camera RGB (or fallback to reflectivity heatmap)
+                        val (r, g, b) = renderer.sampleCameraRgb(rotX, rotY, rotZ)
+                            ?: reflectivityToRgb(p.reflectivity)
 
-                        // 4. Colorize by reflectivity heatmap
-                        val (r, g, b) = reflectivityToRgb(p.reflectivity)
+                        // 4. Transform into ARCore World Space when tracking is active
+                        val worldPt = renderer.transformCameraToWorld(rotX, rotY, rotZ)
 
                         coloredList.add(
                             ColoredPoint3D(
@@ -155,8 +163,10 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
 
-                    accumulatedPoints.addAll(coloredList)
-                    renderer.addColoredWorldPoints(coloredList)
+                    if (coloredList.isNotEmpty()) {
+                        accumulatedPoints.addAll(coloredList)
+                        renderer.addColoredWorldPoints(coloredList)
+                    }
                 } catch (e: Exception) {
                     FileLogger.log("Point mapping error: ${e.message}")
                 }
@@ -190,13 +200,10 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        // Pinch-to-Zoom wired directly to renderer.orbitZoom
         val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 if (!renderer.followArCamera) {
-                    // orbitZoom is negative (e.g. -6f). Dividing by scaleFactor pulls camera closer/farther
-                    val newZoom = (renderer.orbitZoom / detector.scaleFactor).coerceIn(-100f, -0.3f)
-                    renderer.orbitZoom = newZoom
+                    renderer.orbitZoom = (renderer.orbitZoom / detector.scaleFactor).coerceIn(-500f, -0.2f)
                     return true
                 }
                 return false
@@ -240,7 +247,6 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
-        // Top Status Pill
         statusText = TextView(this).apply {
             text = "• Net: Disconnected  |  AR: WAIT  |  0.0k pts"
             setTextColor(Color.WHITE)
@@ -261,7 +267,7 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(statusText, topParams)
 
-        // Right-side Floating Zoom Controls (+ / Reset / −) wired to renderer.orbitZoom
+        // Right-side Floating Zoom Controls (+ / Fit / −)
         zoomControlsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -273,18 +279,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnZoomIn = createZoomButton("+") {
-            renderer.orbitZoom = (renderer.orbitZoom * 0.7f).coerceIn(-100f, -0.3f)
-            Toast.makeText(this, "Camera Distance: ${String.format("%.1f", -renderer.orbitZoom)}m", Toast.LENGTH_SHORT).show()
+            renderer.orbitZoom = (renderer.orbitZoom * 0.65f).coerceIn(-500f, -0.2f)
+            Toast.makeText(this, "Zoom In (${String.format("%.1f", -renderer.orbitZoom)}m)", Toast.LENGTH_SHORT).show()
         }
-        val btnZoomReset = createZoomButton("6m") {
-            renderer.orbitZoom = -6f
-            renderer.orbitAngleX = 20f
-            renderer.orbitAngleY = 0f
-            Toast.makeText(this, "Reset Orbit View (6m)", Toast.LENGTH_SHORT).show()
+        val btnZoomReset = createZoomButton("Fit") {
+            centerAndFitCloudInOrbit()
         }
         val btnZoomOut = createZoomButton("−") {
-            renderer.orbitZoom = (renderer.orbitZoom * 1.4f).coerceIn(-100f, -0.3f)
-            Toast.makeText(this, "Camera Distance: ${String.format("%.1f", -renderer.orbitZoom)}m", Toast.LENGTH_SHORT).show()
+            renderer.orbitZoom = (renderer.orbitZoom * 1.45f).coerceIn(-500f, -0.2f)
+            Toast.makeText(this, "Zoom Out (${String.format("%.1f", -renderer.orbitZoom)}m)", Toast.LENGTH_SHORT).show()
         }
 
         zoomControlsLayout.addView(btnZoomIn)
@@ -300,7 +303,6 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(zoomControlsLayout, zoomParams)
 
-        // Bottom Scrollable Control Bar
         val horizontalScroll = HorizontalScrollView(this).apply {
             isFillViewport = true
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -328,7 +330,6 @@ class MainActivity : AppCompatActivity() {
                     arSession?.resume()
                     btnOrbitToggle.text = "3D Orbit"
                     updateButtonColor(btnOrbitToggle, "#1565C0")
-                    FileLogger.log("Camera mode switched to: AR View (Camera Resumed)")
                     Toast.makeText(this, "Mode: AR Live View", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
                     FileLogger.log("Failed to resume AR session: ${e.message}")
@@ -337,8 +338,7 @@ class MainActivity : AppCompatActivity() {
                 arSession?.pause()
                 btnOrbitToggle.text = "AR View"
                 updateButtonColor(btnOrbitToggle, "#00897B")
-                FileLogger.log("Camera mode switched to: 3D Orbit (Camera Paused)")
-                Toast.makeText(this, "Mode: 3D Orbit (Camera Off)", Toast.LENGTH_SHORT).show()
+                centerAndFitCloudInOrbit()
             }
         }
 
@@ -388,43 +388,94 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
+    /**
+     * Centers the current point cloud at (0,0,0) and sets orbitZoom to fit the cloud's radius.
+     */
+    private fun centerAndFitCloudInOrbit() {
+        if (accumulatedPoints.isEmpty()) {
+            renderer.orbitZoom = -4f
+            Toast.makeText(this, "Orbit View Reset", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        activityScope.launch(Dispatchers.Default) {
+            val snapshot = accumulatedPoints.toList()
+            var sumX = 0.0
+            var sumY = 0.0
+            var sumZ = 0.0
+            for (p in snapshot) {
+                sumX += p.x
+                sumY += p.y
+                sumZ += p.z
+            }
+            val cx = (sumX / snapshot.size).toFloat()
+            val cy = (sumY / snapshot.size).toFloat()
+            val cz = (sumZ / snapshot.size).toFloat()
+
+            var maxDistSq = 0f
+            val centered = ArrayList<ColoredPoint3D>(snapshot.size)
+            for (p in snapshot) {
+                val nx = p.x - cx
+                val ny = p.y - cy
+                val nz = p.z - cz
+                val dSq = nx * nx + ny * ny + nz * nz
+                if (dSq > maxDistSq) maxDistSq = dSq
+                centered.add(p.copy(x = nx, y = ny, z = nz))
+            }
+
+            val radius = sqrt(maxDistSq).coerceIn(1.0f, 100.0f)
+
+            withContext(Dispatchers.Main) {
+                renderer.clearPoints()
+                renderer.addColoredWorldPoints(centered)
+                renderer.orbitAngleX = 20f
+                renderer.orbitAngleY = 0f
+                renderer.orbitZoom = -(radius * 1.6f)
+                Toast.makeText(
+                    this@MainActivity,
+                    "Centered ${centered.size} pts (Fit: ${String.format("%.1f", -renderer.orbitZoom)}m)",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
     private fun runCalibrationWithFeedback() {
-        FileLogger.log("User pressed Calibrate.")
         val sample = lastRawSample
         val arTracking = poseFusionEngine.isTracking
         val pointTotal = renderer.pointCount
+        val colorMode = if (renderer.useCameraRgbColor) "Camera RGB Feed" else "Reflectivity Heatmap"
 
         val sampleInfo = if (sample != null) {
-            "Latest Raw LiDAR Point:\n" +
+            "Latest Valid LiDAR Point (Metric):\n" +
             "  • Forward (X): ${String.format("%.2f", sample.x)} m\n" +
             "  • Left (Y): ${String.format("%.2f", sample.y)} m\n" +
             "  • Up (Z): ${String.format("%.2f", sample.z)} m\n" +
             "  • Reflectivity: ${sample.reflectivity}"
         } else {
-            "Latest Raw LiDAR Point: None received yet (Tap Scan first)"
+            "Latest Valid LiDAR Point: None yet (Tap Scan)"
         }
 
         val statusReport = StringBuilder().apply {
-            append("✅ Axis Transform: Livox (+X Fwd) ➔ OpenGL (-Z Fwd)\n")
-            append("• Current Yaw Offset: ${calibYawDeg.toInt()}°\n")
-            append("• ARCore Tracking: ${if (arTracking) "ACTIVE (World Locked)" else "WAIT (Showing Live Camera-Space Overlay)"}\n")
+            append("✅ Metric Scaling Active (mm ➔ m)\n")
+            append("• Color Mode: $colorMode\n")
+            append("• Yaw Offset: ${calibYawDeg.toInt()}° | Y-Offset: ${calibOffsetY}m\n")
+            append("• ARCore Tracking: ${if (arTracking) "ACTIVE (World Locked)" else "WAIT"}\n")
             append("• Rendered Points: $pointTotal\n\n")
             append(sampleInfo)
         }.toString()
 
         AlertDialog.Builder(this)
-            .setTitle("Calibration & Live Overlay")
+            .setTitle("Calibration & Color Settings")
             .setMessage(statusReport)
-            .setPositiveButton("Rotate +90°") { _, _ ->
+            .setPositiveButton("Toggle Color Mode") { _, _ ->
+                renderer.useCameraRgbColor = !renderer.useCameraRgbColor
+                val newMode = if (renderer.useCameraRgbColor) "Camera RGB" else "Reflectivity Heatmap"
+                Toast.makeText(this, "Color Mode: $newMode", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("Rotate +90°") { _, _ ->
                 calibYawDeg = (calibYawDeg + 90f) % 360f
                 Toast.makeText(this, "LiDAR Yaw rotated to ${calibYawDeg.toInt()}°", Toast.LENGTH_SHORT).show()
-            }
-            .setNeutralButton("Reset 0°") { _, _ ->
-                calibYawDeg = 0f
-                renderer.orbitZoom = -6f
-                renderer.orbitAngleX = 20f
-                renderer.orbitAngleY = 0f
-                Toast.makeText(this, "Calibration Reset to 0°", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Close", null)
             .show()
@@ -509,36 +560,28 @@ class MainActivity : AppCompatActivity() {
 
         activityScope.launch(Dispatchers.IO) {
             try {
-                val inputStream = contentResolver.openInputStream(uri)
-                if (inputStream == null) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Could not open file stream", Toast.LENGTH_SHORT).show()
-                    }
-                    return@launch
-                }
-
+                val inputStream = contentResolver.openInputStream(uri) ?: return@launch
                 val points = inputStream.use { parseAsciiPlyFast(it) }
                 val elapsedMs = System.currentTimeMillis() - startTime
 
                 withContext(Dispatchers.Main) {
                     if (points.isEmpty()) {
-                        Toast.makeText(this@MainActivity, "No points found in PLY file", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "No valid points found in PLY", Toast.LENGTH_SHORT).show()
                         return@withContext
                     }
 
                     accumulatedPoints.clear()
                     renderer.clearPoints()
-
                     accumulatedPoints.addAll(points)
-                    renderer.addColoredWorldPoints(points)
 
                     arSession?.pause()
                     renderer.followArCamera = false
-                    renderer.orbitZoom = -6f
                     btnOrbitToggle.text = "AR View"
                     updateButtonColor(btnOrbitToggle, "#00897B")
 
-                    FileLogger.log("Loaded ${points.size} points in ${elapsedMs}ms (Camera Paused).")
+                    centerAndFitCloudInOrbit()
+
+                    FileLogger.log("Loaded ${points.size} points in ${elapsedMs}ms.")
                     Toast.makeText(
                         this@MainActivity,
                         "Loaded ${points.size} pts in ${elapsedMs}ms",
@@ -554,6 +597,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Fast PLY parser that also cleans up older millimeter-scaled PLY exports:
+     * 1. Strips out repeated (0,0,0) dead sensor returns near the camera origin (< 1m when file has mm points).
+     * 2. Converts coordinates > 80.0 from millimeters to meters (/ 1000f).
+     */
     private fun parseAsciiPlyFast(inputStream: InputStream): List<ColoredPoint3D> {
         val reader = BufferedReader(InputStreamReader(inputStream), 65536)
         var line: String?
@@ -571,14 +619,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val points = ArrayList<ColoredPoint3D>(if (vertexCount > 0) vertexCount else 50000)
+        val rawPoints = ArrayList<ColoredPoint3D>(if (vertexCount > 0) vertexCount else 50000)
         var readCount = 0
         val maxToRead = if (vertexCount > 0) vertexCount else Int.MAX_VALUE
-
-        // Auto-center bounding box calculation so old saved PLY scans appear centered in Orbit View
-        var sumX = 0.0
-        var sumY = 0.0
-        var sumZ = 0.0
+        var hasMillimeterScale = false
 
         while (readCount < maxToRead && reader.readLine().also { line = it } != null) {
             val l = line!!
@@ -596,26 +640,24 @@ class MainActivity : AppCompatActivity() {
                     g = tokenizer.nextToken().toIntOrNull() ?: 255
                     b = tokenizer.nextToken().toIntOrNull() ?: 0
                 }
-                sumX += x
-                sumY += y
-                sumZ += z
-                points.add(ColoredPoint3D(x, y, z, r, g, b, 255))
+                if (abs(x) > 80f || abs(y) > 80f || abs(z) > 80f) {
+                    hasMillimeterScale = true
+                }
+                rawPoints.add(ColoredPoint3D(x, y, z, r, g, b, 255))
                 readCount++
             }
         }
 
-        // Center the loaded cloud at (0, 0, 0) so rotating & zooming in 3D Orbit pivots around the model's center
-        if (points.isNotEmpty()) {
-            val cx = (sumX / points.size).toFloat()
-            val cy = (sumY / points.size).toFloat()
-            val cz = (sumZ / points.size).toFloat()
-            for (i in points.indices) {
-                val p = points[i]
-                points[i] = p.copy(x = p.x - cx, y = p.y - cy, z = p.z - cz)
-            }
-        }
+        if (!hasMillimeterScale) return rawPoints
 
-        return points
+        // Clean up older millimeter-scaled PLY files: filter out the < 2.0m dead origin cluster and divide by 1000f
+        val cleaned = ArrayList<ColoredPoint3D>(rawPoints.size)
+        for (p in rawPoints) {
+            val mag = abs(p.x) + abs(p.y) + abs(p.z)
+            if (mag < 5.0f) continue // Skip the 0.0314 0.4008 0.3543 dead-return points
+            cleaned.add(p.copy(x = p.x / 1000f, y = p.y / 1000f, z = p.z / 1000f))
+        }
+        return cleaned
     }
 
     private fun exportPointCloudsToPly() {
