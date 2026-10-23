@@ -41,9 +41,18 @@ class ArPointCloudRenderer(
     @Volatile var pointCount = 0
         private set
 
-    // Latest ARCore camera pose so incoming LiDAR points can be anchored in 3D World Space
     @Volatile var latestCameraPose: Pose? = null
         private set
+
+    // Latest YUV luminance & chroma planes copied from ARCore camera frame for fast thread-safe RGB sampling
+    @Volatile private var yuvWidth = 0
+    @Volatile private var yuvHeight = 0
+    @Volatile private var yPlaneBytes: ByteArray? = null
+    @Volatile private var uPlaneBytes: ByteArray? = null
+    @Volatile private var vPlaneBytes: ByteArray? = null
+    @Volatile private var yRowStride = 0
+    @Volatile private var uvRowStride = 0
+    @Volatile private var uvPixelStride = 0
 
     val recordedColoredPoints = CopyOnWriteArrayList<ColoredPoint3D>()
 
@@ -52,15 +61,15 @@ class ArPointCloudRenderer(
     private val vPMatrix = FloatArray(16)
 
     @Volatile var followArCamera = true
+    @Volatile var useCameraRgbColor = true
     @Volatile var orbitAngleX = 20f
     @Volatile var orbitAngleY = 0f
-    @Volatile var orbitZoom = -6f
-    @Volatile var pointSize = 8.0f
+    @Volatile var orbitZoom = -4f
+    @Volatile var pointSize = 9.0f
 
     private var pointProgram = 0
     private var bgProgram = 0
 
-    // Normalized Device Coordinates (NDC) for full-screen quad
     private val quadCoords: FloatBuffer = ByteBuffer
         .allocateDirect(4 * 2 * 4)
         .order(ByteOrder.nativeOrder())
@@ -75,7 +84,6 @@ class ArPointCloudRenderer(
             position(0)
         }
 
-    // Dynamically transformed UV coordinates populated by ARCore
     private val transformedTexCoords: FloatBuffer = ByteBuffer
         .allocateDirect(4 * 2 * 4)
         .order(ByteOrder.nativeOrder())
@@ -131,10 +139,6 @@ class ArPointCloudRenderer(
         }
     """.trimIndent()
 
-    /**
-     * Transforms a point from local ARCore Camera Space (-Z forward, +X right, +Y up)
-     * into ARCore World Space if tracking is active, or returns it directly if not tracking.
-     */
     fun transformCameraToWorld(camX: Float, camY: Float, camZ: Float): FloatArray {
         val pose = latestCameraPose
         return if (followArCamera && fusionEngine.isTracking && pose != null) {
@@ -142,6 +146,42 @@ class ArPointCloudRenderer(
         } else {
             floatArrayOf(camX, camY, camZ)
         }
+    }
+
+    /**
+     * Samples the real-time ARCore camera feed at a 3D point in local Camera Space (-Z forward, +X right, +Y up).
+     * Returns null if the point falls outside the camera FOV or if no frame has been captured yet.
+     */
+    fun sampleCameraRgb(camX: Float, camY: Float, camZ: Float): Triple<Int, Int, Int>? {
+        if (!useCameraRgbColor || camZ >= -0.05f) return null
+        val yData = yPlaneBytes ?: return null
+        val uData = uPlaneBytes ?: return null
+        val vData = vPlaneBytes ?: return null
+        val w = yuvWidth
+        val h = yuvHeight
+        if (w <= 0 || h <= 0) return null
+
+        // Project camera-space 3D point using approximate 62° horizontal / 48° vertical FOV
+        val normX = (camX / -camZ) / 0.60f
+        val normY = (camY / -camZ) / 0.45f
+        if (normX < -1f || normX > 1f || normY < -1f || normY > 1f) return null
+
+        // Map to sensor UV (sensor image is landscape, rotated 90° relative to portrait screen)
+        val u = ((0.5f - normY * 0.5f) * (w - 1)).toInt().coerceIn(0, w - 1)
+        val v = ((0.5f - normX * 0.5f) * (h - 1)).toInt().coerceIn(0, h - 1)
+
+        val yIdx = v * yRowStride + u
+        val uvIdx = (v / 2) * uvRowStride + (u / 2) * uvPixelStride
+        if (yIdx >= yData.size || uvIdx >= uData.size || uvIdx >= vData.size) return null
+
+        val yVal = (yData[yIdx].toInt() and 0xFF)
+        val uVal = (uData[uvIdx].toInt() and 0xFF) - 128
+        val vVal = (vData[uvIdx].toInt() and 0xFF) - 128
+
+        val r = (yVal + 1.370705f * vVal).toInt().coerceIn(0, 255)
+        val g = (yVal - 0.337633f * uVal - 0.698001f * vVal).toInt().coerceIn(0, 255)
+        val b = (yVal + 1.732446f * uVal).toInt().coerceIn(0, 255)
+        return Triple(r, g, b)
     }
 
     @Synchronized
@@ -205,7 +245,7 @@ class ArPointCloudRenderer(
         viewportWidth = width
         viewportHeight = height
         val ratio = width.toFloat() / height.toFloat()
-        Matrix.frustumM(projectionMatrix, 0, -ratio * 0.1f, ratio * 0.1f, -0.1f, 0.1f, 0.1f, 200f)
+        Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 2000f)
     }
 
     @Synchronized
@@ -270,35 +310,51 @@ class ArPointCloudRenderer(
                         fusionEngine.isTracking = true
                         latestCameraPose = camera.pose
                         fusionEngine.recordPose(System.nanoTime(), camera.pose)
-                        if (frameCounter++ % 2 == 0) {
+                        if (frameCounter++ % 3 == 0) {
                             try {
                                 frame.acquireCameraImage().use { image ->
                                     colorizer.updateFromArFrame(image, camera.imageIntrinsics)
+                                    // Snapshot YUV planes for live RGB point coloring
+                                    if (image.planes.size >= 3) {
+                                        val yBuf = image.planes[0].buffer
+                                        val uBuf = image.planes[1].buffer
+                                        val vBuf = image.planes[2].buffer
+                                        val yArr = ByteArray(yBuf.remaining())
+                                        val uArr = ByteArray(uBuf.remaining())
+                                        val vArr = ByteArray(vBuf.remaining())
+                                        yBuf.get(yArr)
+                                        uBuf.get(uArr)
+                                        vBuf.get(vArr)
+                                        yuvWidth = image.width
+                                        yuvHeight = image.height
+                                        yRowStride = image.planes[0].rowStride
+                                        uvRowStride = image.planes[1].rowStride
+                                        uvPixelStride = image.planes[1].pixelStride
+                                        yPlaneBytes = yArr
+                                        uPlaneBytes = uArr
+                                        vPlaneBytes = vArr
+                                    }
                                 }
                             } catch (_: Exception) {}
                         }
                         camera.getViewMatrix(viewMatrix, 0)
-                        camera.getProjectionMatrix(projectionMatrix, 0, 0.05f, 150.0f)
+                        camera.getProjectionMatrix(projectionMatrix, 0, 0.05f, 500.0f)
                     } else {
                         fusionEngine.isTracking = false
-                        // Fallback camera view matrix when ARCore is still in WAIT state
-                        // so you can STILL see live LiDAR points in front of you immediately!
                         Matrix.setIdentityM(viewMatrix, 0)
                         if (viewportWidth > 0 && viewportHeight > 0) {
                             val ratio = viewportWidth.toFloat() / viewportHeight.toFloat()
-                            Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 150f)
+                            Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 500f)
                         }
                     }
-                } catch (_: Exception) {
-                    // Ignore transient session pause exceptions
-                }
+                } catch (_: Exception) {}
             }
         } else {
-            // 3D Orbit Mode (Camera feed is off, pure 3D inspection)
+            // 3D Orbit Mode (Camera Off, pure 3D inspection)
             GLES20.glEnable(GLES20.GL_DEPTH_TEST)
             if (viewportWidth > 0 && viewportHeight > 0) {
                 val ratio = viewportWidth.toFloat() / viewportHeight.toFloat()
-                Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 250f)
+                Matrix.perspectiveM(projectionMatrix, 0, 60f, ratio, 0.05f, 2000f)
             }
             Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, orbitZoom, 0f, 0f, 0f, 0f, 1f, 0f)
             val rot = FloatArray(16)
